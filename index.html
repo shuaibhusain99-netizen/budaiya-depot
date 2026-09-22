@@ -970,7 +970,7 @@ function openReadOnlyCopy(file){
   reader.readAsArrayBuffer(file);
 }
 function exportDatabaseCopy(){ download(`budaiya-depot-copy-${todayStr()}.sqlite`, new Blob([DB.export()],{type:'application/x-sqlite3'})); toast('Copy downloaded','good'); }
-async function disconnectFile(){ cloudClearSession(); sessionStorage.removeItem('depot_user'); location.reload(); }
+async function disconnectFile(){ cloudClearSession(); forgetAppSession(); sessionStorage.removeItem('depot_user'); location.reload(); }
 /* Engineer only: replace the whole online database with a .sqlite file (restore / migrate). */
 async function replaceCloudWithFile(file){
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -1036,6 +1036,7 @@ async function changePassword(username, newPw){
   const salt=randomSalt(); const h=await sha256Hex(salt+':'+newPw);
   await mutate(()=> run('UPDATE users SET pass_hash=?, salt=? WHERE username=?',[h,salt,username]));
   if(username==='engineer' && SALARY_KEY){
+    setTimeout(()=>{ if(CURRENT_USER && localStorage.getItem(APP_SES_KEY)) rememberAppSession(); }, 500);
     // re-encrypt all salaries under a new key derived from the new password
     const saltB64 = b64e(crypto.getRandomValues(new Uint8Array(16)));
     const key = await deriveSalaryKey(newPw, saltB64);
@@ -1052,7 +1053,7 @@ function b64d(s){ const bin=atob(s); const u=new Uint8Array(bin.length); for(let
 async function deriveSalaryKey(password, saltB64){
   const salt = b64d(saltB64);
   const km = await crypto.subtle.importKey('raw', _te.encode('salary:'+password), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:SALARY_ITER, hash:'SHA-256'}, km, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:SALARY_ITER, hash:'SHA-256'}, km, {name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
 }
 async function encNum(key, n){ const iv=crypto.getRandomValues(new Uint8Array(12)); const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv}, key, _te.encode(String(n)))); return b64e(iv)+':'+b64e(ct); }
 async function decNum(key, blob){ try{ const [ivB,ctB]=blob.split(':'); const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64d(ivB)}, key, b64d(ctB)); return Number(_td.decode(pt))||0; }catch(e){ return 0; } }
@@ -1082,6 +1083,30 @@ async function unlockSalaries(password){
   q('SELECT card_no, blob FROM secure_salary').forEach(async r=>{ SALARY[r.card_no] = await decNum(key, r.blob); });
   // decrypt synchronously into SALARY (await all)
   await Promise.all(q('SELECT card_no, blob FROM secure_salary').map(async r=>{ SALARY[r.card_no] = await decNum(key, r.blob); }));
+}
+/* ---- stay signed in on this device (app user + salary key, stored only in this browser) ---- */
+const APP_SES_KEY = 'depot-app-session';
+async function rememberAppSession(){
+  try{ const o={username:CURRENT_USER.username}; if(CURRENT_USER.role==='engineer' && SALARY_KEY) o.k=b64e(new Uint8Array(await crypto.subtle.exportKey('raw', SALARY_KEY))); localStorage.setItem(APP_SES_KEY, JSON.stringify(o)); }catch(e){ console.warn('could not remember session', e); }
+}
+function forgetAppSession(){ localStorage.removeItem(APP_SES_KEY); }
+async function restoreAppSession(){
+  let o=null; try{ o=JSON.parse(localStorage.getItem(APP_SES_KEY)||'null'); }catch(e){}
+  if(!o || !o.username) return false;
+  const u = q1('SELECT * FROM users WHERE lower(username)=lower(?)',[o.username]); if(!u){ forgetAppSession(); return false; }
+  CURRENT_USER = {username:u.username, role:u.role, display:u.display||u.username};
+  if(u.role==='engineer'){
+    if(!o.k){ CURRENT_USER=null; return false; }
+    try{
+      const key = await crypto.subtle.importKey('raw', b64d(o.k), {name:'AES-GCM'}, true, ['encrypt','decrypt']);
+      const v = qv('SELECT value FROM secure_meta WHERE key=?',['verifier']);
+      if(v && await decNum(key, v)!==1){ forgetAppSession(); CURRENT_USER=null; return false; }   // password changed → sign in again
+      SALARY_KEY = key; SALARY = {};
+      await Promise.all(q('SELECT card_no, blob FROM secure_salary').map(async r=>{ SALARY[r.card_no] = await decNum(key, r.blob); }));
+    }catch(e){ forgetAppSession(); CURRENT_USER=null; SALARY_KEY=null; return false; }
+  }
+  sessionStorage.setItem('depot_user', u.username);
+  return true;
 }
 async function setSalary(cardNo, value){
   if(!SALARY_KEY) return;
@@ -1116,6 +1141,7 @@ function renderLogin(){
     <form id="login-form" class="start-btns" style="gap:10px">
       <div class="field"><label>User</label><select id="lg-user" class="sel" style="width:100%">${q('SELECT username, display FROM users ORDER BY role').map(u=>`<option value="${esc(u.username)}">${esc(u.display||u.username)}</option>`).join('')}</select></div>
       <div class="field"><label>Password</label><input id="lg-pass" type="password" autocomplete="current-password" style="width:100%"></div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:2px 0 6px"><input type="checkbox" id="lg-stay" checked> Stay signed in on this device</label>
       <button class="btn btn-primary" type="submit">Sign in</button>
       <button class="btn btn-ghost" type="button" id="lg-switch">Sign out of the online database</button>
     </form><div id="lg-err" style="color:var(--bad);font-size:13px"></div></div>`;
@@ -1127,12 +1153,13 @@ function renderLogin(){
     if(!u){ document.getElementById('lg-err').textContent='Wrong password'; document.getElementById('lg-pass').select(); return; }
     CURRENT_USER = u; sessionStorage.setItem('depot_user', u.username);
     if(u.role==='engineer'){ try{ await unlockSalaries(document.getElementById('lg-pass').value); }catch(err){ console.error(err); toast('Could not unlock salary data','bad'); } }
+    if(document.getElementById('lg-stay').checked) await rememberAppSession(); else forgetAppSession();
     if(!viewAllowed(VIEW)) VIEW='dashboard';
     enterApp();
   });
   document.getElementById('lg-switch').addEventListener('click', ()=> disconnectFile());
 }
-function logout(){ CURRENT_USER=null; SALARY_KEY=null; SALARY={}; sessionStorage.removeItem('depot_user'); VIEW='dashboard'; renderLogin(); }
+function logout(){ CURRENT_USER=null; SALARY_KEY=null; SALARY={}; forgetAppSession(); sessionStorage.removeItem('depot_user'); VIEW='dashboard'; renderLogin(); }
 function enterApp(){
   document.documentElement.setAttribute('data-theme', getSetting('theme','dark'));
   render();
@@ -1141,6 +1168,7 @@ function enterApp(){
 /* called once the database file is open */
 async function startApp(){
   await ensureDefaultUsers();
+  if(await restoreAppSession()){ if(!viewAllowed(VIEW)) VIEW='dashboard'; enterApp(); return; }
   renderLogin();
 }
 

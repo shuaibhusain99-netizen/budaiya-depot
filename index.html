@@ -958,6 +958,7 @@ async function mutate(fn){
 }
 setInterval(async ()=>{ if(DB && !document.hidden && await refreshFromFile()){ render(); toast('Database updated by another user — screen refreshed','warn'); } }, 15000);
 window.addEventListener('focus', async ()=>{ if(DB && await refreshFromFile()) render(); });
+window.addEventListener('beforeunload', e=>{ if(DB_STATUS.saving){ e.preventDefault(); e.returnValue='Still saving to the online database — wait a moment before closing.'; } });
 
 /* ---------- start-up flows ---------- */
 function openReadOnlyCopy(file){
@@ -980,6 +981,20 @@ async function replaceCloudWithFile(file){
   if(DB_STATUS.error) throw new Error(DB_STATUS.error);
 }
 async function cloudListBackups(){ return cloudRest('depot_backup?select=day,size,updated_by,updated_at&order=day.desc'); }
+async function cloudListHistory(){ try{ return await cloudRest('depot_history?select=version,size,updated_by,updated_at&order=version.desc&limit=200'); }catch(e){ return []; } }
+async function cloudDownloadHistory(version){
+  const rows = await cloudRest('depot_history?version=eq.'+encodeURIComponent(version)+'&select=data');
+  if(!rows.length) throw new Error('Version not found');
+  download(`budaiya-depot-v${version}.sqlite`, new Blob([await unpackDb(rows[0].data)],{type:'application/x-sqlite3'}));
+}
+async function cloudRestoreHistory(version){
+  const rows = await cloudRest('depot_history?version=eq.'+encodeURIComponent(version)+'&select=data');
+  if(!rows.length) throw new Error('Version not found');
+  const bytes = await unpackDb(rows[0].data);
+  await SAVE_QUEUE; await refreshFromFile();
+  openBytes(bytes); await saveToFile();
+  if(DB_STATUS.error) throw new Error(DB_STATUS.error);
+}
 async function cloudDownloadBackup(day){
   const rows = await cloudRest('depot_backup?day=eq.'+encodeURIComponent(day)+'&select=data');
   if(!rows.length) throw new Error('Backup not found');
@@ -3014,7 +3029,7 @@ function renderData(){
     ${can('settings')?`<div class="panel"><div class="panel-head"><h3>Clear old records</h3><span class="tag">engineer only</span></div><div class="panel-body pad">
       <p>Cost analysis has no stored totals — it adds up the dated records (timesheets, jobs, fuel &amp; expenses, stock movements) for whatever period you pick. To wipe the cost of an old period, delete those records. This removes them for everyone and cannot be undone, but today's automatic server backup is kept, and you can download a copy first below.</p>
       <div class="btn-row" style="align-items:center;gap:14px;flex-wrap:wrap">
-        <label>Delete records dated <b>before</b> <input type="date" class="inp" id="purge-date" value="${todayStr()}"></label>
+        <label>Delete records dated <b>before</b> <input type="date" class="inp" id="purge-date" value=""></label>
       </div>
       <div style="margin:10px 0;display:flex;flex-direction:column;gap:6px">
         <label class="chk"><input type="checkbox" id="pg-att" checked> Timesheets / attendance</label>
@@ -3023,13 +3038,17 @@ function renderData(){
         <label class="chk"><input type="checkbox" id="pg-stock" checked> Stock movements</label>
         <label class="chk"><input type="checkbox" id="pg-moves"> Closed vehicle / equipment / maintenance movements (returned before that date)</label>
       </div>
-      <div class="btn-row"><button class="btn" id="pg-preview">Preview how many</button><button class="btn btn-danger" id="pg-run">Delete these records</button></div>
+      <div class="btn-row"><button class="btn" id="pg-preview">Preview how many</button><button class="btn btn-danger" id="pg-run" disabled title="Preview first">Delete these records</button></div>
       <div id="pg-out" style="margin-top:10px"></div>
       <p class="field-note" style="margin-top:8px">Registers (vehicles, equipment, employees, stock item list) are never touched — only dated log rows. This does not affect the online sign-in or the connection settings.</p>
     </div></div>`:''}
     <div class="panel"><div class="panel-head"><h3>Tables</h3></div><div class="panel-body"><table class="plain"><thead><tr><th>Screen</th><th>SQL table</th><th class="num">Rows</th></tr></thead><tbody>${counts}</tbody></table></div></div>
   </div>`;
-  const bk=document.getElementById('db-baks'); if(bk) bk.addEventListener('click', async ()=>{ const box=document.getElementById('db-baks-list'); box.textContent='Loading…'; try{ const rows=await cloudListBackups(); box.innerHTML = rows.length ? `<table class="plain"><thead><tr><th>Day</th><th>Last saved by</th><th class="num">Size</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td class="mono">${esc(r.day)}</td><td>${esc(r.updated_by||'')}</td><td class="num mono">${Math.round((r.size||0)/1024)} KB</td><td><button class="btn btn-ghost" data-bak="${esc(r.day)}">Download</button></td></tr>`).join('')}</tbody></table>` : 'No backups yet.'; box.querySelectorAll('[data-bak]').forEach(b=> b.addEventListener('click', async ()=>{ try{ await cloudDownloadBackup(b.dataset.bak); }catch(e){ toast(e.message,'bad'); } })); }catch(e){ box.textContent=e.message; } });
+  const bk=document.getElementById('db-baks'); if(bk) bk.addEventListener('click', async ()=>{ const box=document.getElementById('db-baks-list'); box.textContent='Loading…'; try{ const rows=await cloudListBackups(); const hist=await cloudListHistory(); const fmtT=t=>{ const d=new Date(t); return isNaN(d)?String(t):d.toLocaleString(); };
+      box.innerHTML = `<p class="muted" style="font-size:12px">Version history — every save is kept (last 200). Pick the version from just before a mistake, download it to check, or restore it for everyone.</p>` + (hist.length ? `<div style="max-height:260px;overflow:auto"><table class="plain"><thead><tr><th>Version</th><th>Saved at</th><th>By</th><th class="num">Size</th><th></th></tr></thead><tbody>${hist.map(r=>`<tr><td class="mono">v${r.version}</td><td>${esc(fmtT(r.updated_at))}</td><td>${esc(r.updated_by||'')}</td><td class="num mono">${Math.round((r.size||0)/1024)} KB</td><td><button class="btn btn-ghost" data-hist="${r.version}">Download</button> <button class="btn btn-ghost" data-restore="${r.version}">Restore</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No version history yet.</p>') + `<p class="muted" style="font-size:12px;margin-top:10px">Daily snapshots (last state saved each day, 30 days):</p>` + (rows.length ? `<table class="plain"><thead><tr><th>Day</th><th>Last saved by</th><th class="num">Size</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td class="mono">${esc(r.day)}</td><td>${esc(r.updated_by||'')}</td><td class="num mono">${Math.round((r.size||0)/1024)} KB</td><td><button class="btn btn-ghost" data-bak="${esc(r.day)}">Download</button></td></tr>`).join('')}</tbody></table>` : 'No daily backups yet.');
+      box.querySelectorAll('[data-bak]').forEach(b=> b.addEventListener('click', async ()=>{ try{ await cloudDownloadBackup(b.dataset.bak); }catch(e){ toast(e.message,'bad'); } }));
+      box.querySelectorAll('[data-hist]').forEach(b=> b.addEventListener('click', async ()=>{ try{ await cloudDownloadHistory(b.dataset.hist); }catch(e){ toast(e.message,'bad'); } }));
+      box.querySelectorAll('[data-restore]').forEach(b=> b.addEventListener('click', async ()=>{ if(!confirm(`Restore version v${b.dataset.restore} for everyone? The current state is kept in the history too, so this can be undone.`)) return; try{ await cloudRestoreHistory(b.dataset.restore); toast('Version restored — signing in again','good'); setTimeout(()=>{ sessionStorage.removeItem('depot_user'); location.reload(); },1200); }catch(e){ toast(e.message,'bad'); } })); }catch(e){ box.textContent=e.message; } });
   const rp=document.getElementById('db-replace'), rpf=document.getElementById('db-replace-file'); if(rp){ rp.addEventListener('click', ()=>{ if(confirm('This REPLACES the whole online database for everyone with the file you choose. Today\'s server backup is kept. Continue?')) rpf.click(); }); rpf.addEventListener('change', async e=>{ const f=e.target.files[0]; if(!f) return; try{ await replaceCloudWithFile(f); toast('Online database replaced — please sign in again','good'); setTimeout(()=>{ sessionStorage.removeItem('depot_user'); location.reload(); }, 1500); }catch(ex){ toast(ex.message,'bad'); } }); }
   document.getElementById('db-copy').addEventListener('click', exportDatabaseCopy);
   document.getElementById('db-forget').addEventListener('click', ()=>{ if(confirm('Sign this device out of the online database? Nothing is deleted.')) disconnectFile(); });
@@ -3053,12 +3072,14 @@ function renderData(){
       if(document.getElementById('pg-moves').checked){ list.push(['Vehicle movements (closed)','vehicle_moves','return_date IS NOT NULL AND return_date<>"" AND return_date<?',[d]]); list.push(['Equipment movements (closed)','equipment_moves','return_date IS NOT NULL AND return_date<>"" AND return_date<?',[d]]); list.push(['Maintenance (closed)','maintenance','return_date IS NOT NULL AND return_date<>"" AND return_date<?',[d]]); }
       return {d, list}; };
     const counts=()=>{ const {d,list}=specs(); return {d, rows:list.map(([label,tbl,where,p])=>({label,tbl,where,p,n:qv(`SELECT COUNT(*) FROM ${tbl} WHERE ${where}`,p)}))}; };
-    document.getElementById('pg-preview').addEventListener('click', ()=>{ const {d,rows}=counts(); const tot=rows.reduce((s,r)=>s+r.n,0); document.getElementById('pg-out').innerHTML = !d ? '<span class="badge bad">Pick a date first</span>' : `<table class="plain"><tbody>${rows.map(r=>`<tr><td>${esc(r.label)}</td><td class="num mono">${num(r.n)}</td></tr>`).join('')}<tr><td><b>Total to delete</b></td><td class="num mono"><b>${num(tot)}</b></td></tr></tbody></table>`; });
+    [dEl,'pg-att','pg-work','pg-exp','pg-stock','pg-moves'].forEach(x=>{ const el=typeof x==='string'?document.getElementById(x):x; el.addEventListener('change', ()=>{ document.getElementById('pg-run').disabled=true; }); });
+    document.getElementById('pg-preview').addEventListener('click', ()=>{ const {d,rows}=counts(); const tot=rows.reduce((s,r)=>s+r.n,0); document.getElementById('pg-run').disabled = !d || !tot; document.getElementById('pg-out').innerHTML = !d ? '<span class="badge bad">Pick a date first</span>' : `<table class="plain"><tbody>${rows.map(r=>`<tr><td>${esc(r.label)}</td><td class="num mono">${num(r.n)}</td></tr>`).join('')}<tr><td><b>Total to delete</b></td><td class="num mono"><b>${num(tot)}</b></td></tr></tbody></table>`; });
     document.getElementById('pg-run').addEventListener('click', async ()=>{ const {d,rows}=counts(); const tot=rows.reduce((s,r)=>s+r.n,0);
       if(!d){ toast('Pick a date first','bad'); return; }
       if(!rows.length){ toast('Tick at least one type of record','bad'); return; }
       if(!tot){ toast('Nothing dated before '+d,'warn'); return; }
-      if(!confirm(`Permanently delete ${tot} record(s) dated before ${d}?\n\n`+rows.filter(r=>r.n).map(r=>`• ${r.n} ${r.label}`).join('\n')+`\n\nToday's server backup is kept. This cannot be undone.`)) return;
+      const typed = prompt(`Permanently delete ${tot} record(s) dated before ${d}?\n\n`+rows.filter(r=>r.n).map(r=>`• ${r.n} ${r.label}`).join('\n')+`\n\nThe previous state is kept in Server backups → Version history.\nType DELETE to confirm:`);
+      if(typed!=='DELETE'){ toast('Cancelled — nothing deleted','warn'); return; }
       try{ await mutate(()=>{ rows.forEach(r=>{ if(r.n) run(`DELETE FROM ${r.tbl} WHERE ${r.where}`, r.p); }); }); toast(`Deleted ${tot} record(s) before ${d}`,'good'); renderData(); }
       catch(e){ toast('Could not delete: '+e.message,'bad'); } });
   })();

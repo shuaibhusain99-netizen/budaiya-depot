@@ -637,7 +637,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
      again so the screen never shows a stale copy.
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -781,6 +781,18 @@ function migrate(){
   run("UPDATE vehicles SET project=CASE WHEN lower(COALESCE(site,'')) LIKE '%isa town%' THEN 'Isa Town Depot' ELSE 'Budaiya Depot' END WHERE project IS NULL OR project=''");
   run("UPDATE equipment SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
   run("UPDATE employees SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
+  // v10: movements carry team + project; expenses carry project; utilisation has its own switch
+  [['vehicle_moves','team'],['vehicle_moves','project'],['equipment_moves','team'],['equipment_moves','project'],['expenses','project']].forEach(([t,c])=>{ if(!hasColumn(t,c)) run(`ALTER TABLE ${t} ADD COLUMN ${c} TEXT`); });
+  ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'count_util')){ run(`ALTER TABLE ${t} ADD COLUMN count_util INTEGER DEFAULT 1`); run(`UPDATE ${t} SET count_util=COALESCE(count_cost,1)`); } });
+  run("UPDATE vehicle_moves SET project=purpose WHERE (project IS NULL OR project='') AND COALESCE(purpose,'')<>''");
+  run("UPDATE equipment_moves SET team=issued_to WHERE (team IS NULL OR team='') AND COALESCE(issued_to,'')<>''");
+  run("UPDATE vehicle_moves SET team=(SELECT v.team FROM vehicles v WHERE v.vno=vehicle_moves.vno) WHERE (team IS NULL OR team='')");
+  run("UPDATE vehicle_moves SET project=(SELECT v.project FROM vehicles v WHERE v.vno=vehicle_moves.vno) WHERE (project IS NULL OR project='')");
+  run("UPDATE equipment_moves SET project=(SELECT e.project FROM equipment e WHERE e.item=equipment_moves.item AND (e.serial=equipment_moves.serial OR COALESCE(equipment_moves.serial,'')='') LIMIT 1) WHERE (project IS NULL OR project='')");
+  run("UPDATE expenses SET project=COALESCE((SELECT v.project FROM vehicles v WHERE asset_type='Vehicle' AND v.vno=expenses.asset_ref),(SELECT e.project FROM equipment e WHERE asset_type='Equipment' AND e.no=expenses.asset_ref)) WHERE (project IS NULL OR project='')");
+  run("UPDATE vehicle_moves SET project=(SELECT t.project FROM teams t WHERE t.team=vehicle_moves.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''");
+  run("UPDATE equipment_moves SET project=(SELECT t.project FROM teams t WHERE t.team=equipment_moves.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''");
+  run("UPDATE expenses SET project=(SELECT t.project FROM teams t WHERE t.team=expenses.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''");
   if(!qv('SELECT COUNT(*) FROM teams')){
     const rows = q(`SELECT team, project, COUNT(*) n FROM (
         SELECT team, project FROM employees WHERE COALESCE(team,'')<>''
@@ -789,6 +801,7 @@ function migrate(){
       ) GROUP BY team, project`);
     const best = {}; rows.forEach(r=>{ const t=r.team; if(!best[t] || r.n>best[t].n) best[t]={project:r.project||'Budaiya Depot', n:r.n}; });
     Object.entries(best).forEach(([team,v])=> run('INSERT INTO teams(team,project) VALUES(?,?)',[team, v.project]));
+    ['vehicle_moves','equipment_moves','expenses'].forEach(t=> run(`UPDATE ${t} SET project=(SELECT x.project FROM teams x WHERE x.team=${t}.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''`));
   }
   run("UPDATE equipment SET rental_basis='month' WHERE rental_basis IS NULL OR rental_basis=''");
   const defaults = {theme:'dark', overdue_days:14, default_min:1, days_per_month:30, hours_per_day:8, ot_multiplier:1.25, holiday_multiplier:1.25, food_rate:1, hire_hours_per_day:12, charge_basic:'attended', site_name:'DEPOT - BUDAIYA', prepared_by:'', projects:'Budaiya Depot\nIsa Town Depot', default_project:'Budaiya Depot', team_aliases:'Sono = Sonoo\nSonu = Sonoo\nHaris = Hares\nAkhlaq = Ikhlaq\nHaytun Nobi = Hayatun Nobi\nNabiur = Nabiur Rahman'};
@@ -1417,7 +1430,7 @@ const ENTITIES = {
       {key:'vno', label:'Vehicle No.', type:'text', required:true, mono:true, w:110},
       {key:'type', label:'Type', type:'combo', options:['PICKUP','SIXWHEEL','HIAB','TANKER','OTHER'], w:100},
       {key:'model', label:'Model', type:'text', w:200},
-      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:130, hint:'Used to allocate hire cost to a team in the cost analysis. Picking a team fills the Project from the Teams register.'},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:130, hint:'Usual team. The table shows the live team from an open movement with a “now” tag.'},
       {key:'driver', label:'Default driver', type:'combo', list:{table:'drivers', col:'name'}, w:230, hint:'The table shows the current driver from the open Vehicle log movement when there is one; this is the fallback'},
       {key:'status', label:'Live status', type:'select', options:['GOOD','NEEDS SERVICE','OUT OF SERVICE','standby'], badge:true, w:150, hint:'Auto: shows In maintenance / Out / Available from the logs. This stored value is used only when nothing else applies.'},
       {key:'site', label:'Site / Dept', type:'combo', list:{table:'departments', col:'department'}, w:150},
@@ -1425,6 +1438,7 @@ const ENTITIES = {
       {key:'rental_rate', label:'Hire rate', type:'money', w:100, num:true, section:'Rental (cost analysis)'},
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, w:90, moneyOnly:true},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this vehicle from cost analysis and utilisation'},
+      {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
     ],
     search:['vno','type','model','team','driver','site','project'], defaultSort:{field:'vno', dir:'asc'},
@@ -1434,15 +1448,16 @@ const ENTITIES = {
     columns:[
       {key:'date_out', label:'Date out', type:'date', required:true, w:115, default:()=>todayStr()},
       {key:'time_out', label:'Time out', type:'time', w:90, default:()=>nowTime()},
-      {key:'vno', label:'Vehicle No.', type:'combo', required:true, mono:true, list:{table:'vehicles', col:'vno'}, w:110},
+      {key:'vno', label:'Vehicle No.', type:'combo', required:true, mono:true, list:{table:'vehicles', col:'vno'}, linkTo:{target:'team', table:'vehicles', match:'vno', value:'team'}, w:110, hint:'Picking a vehicle fills its usual team; the team fills the project'},
       {key:'driver', label:'Driver', type:'combo', list:{table:'drivers', col:'name'}, linkTo:{target:'cpr', table:'drivers', match:'name', value:'cpr'}, w:210},
       {key:'cpr', label:'CPR', type:'text', mono:true, w:110},
-      {key:'purpose', label:'Purpose / site', type:'text', w:160},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:130, hint:'Team using the vehicle on this trip — shown live on the Vehicles page'},
+      {key:'project', label:'Project', type:'combo', optionsFn:()=>projectNames(), w:140, hint:'Filled from the Teams register when a team is picked — change it if this trip is for another project'},
       {key:'return_date', label:'Return date', type:'date', w:115},
       {key:'return_time', label:'Return time', type:'time', w:95}
     ],
     statusOf: r=> r.return_date ? {label:'Returned', tone:'good'} : {label:'Out', tone:'bad'},
-    search:['vno','driver','cpr','purpose'], dateField:'date_out', defaultSort:{field:'date_out', dir:'desc'},
+    search:['vno','driver','cpr','team','project','purpose'], dateField:'date_out', defaultSort:{field:'date_out', dir:'desc'},
     chips:[{id:'', label:'All'},{id:'open', label:'Out now', where:'(return_date IS NULL OR return_date="")'},{id:'ret', label:'Returned', where:'return_date<>""'}]
   },
   equipment: { table:'equipment', label:'Equipment', singular:'Equipment', icon:ICONS.tool, group:'Equipment', detail:'Equipment',
@@ -1457,6 +1472,7 @@ const ENTITIES = {
       {key:'rental_rate', label:'Hire rate', type:'money', w:100, num:true, section:'Rental (cost analysis)'},
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, w:90, moneyOnly:true},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this equipment from cost analysis and utilisation'},
+      {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
     ],
     search:['no','item','serial','team','project'], defaultSort:{field:'no', dir:'asc'},
@@ -1470,12 +1486,13 @@ const ENTITIES = {
       {key:'time_out', label:'Time out', type:'time', w:90, default:()=>nowTime()},
       {key:'department', label:'Department', type:'combo', optionsFn:()=>deptNames(), w:160},
       {key:'assigned', label:'Vehicle / site / supplier', type:'combo', mono:true, dependsOn:'department', optionsFn:(vals)=> vals.department ? deptInside(vals.department) : allInside(), w:150},
-      {key:'issued_to', label:'Issued to', type:'text', w:140},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:130, hint:'Team the equipment is issued to — shown live on the Equipment page'},
+      {key:'project', label:'Project', type:'combo', optionsFn:()=>projectNames(), w:140, hint:'Filled from the Teams register when a team is picked — change it if needed'},
       {key:'return_date', label:'Return date', type:'date', w:115},
       {key:'return_time', label:'Return time', type:'time', w:95}
     ],
     statusOf: r=> r.return_date ? {label:'Returned', tone:'good'} : {label:'Out', tone:'bad'},
-    search:['item','serial','department','assigned','issued_to'], dateField:'date_out', defaultSort:{field:'date_out', dir:'desc'},
+    search:['item','serial','department','assigned','team','project','issued_to'], dateField:'date_out', defaultSort:{field:'date_out', dir:'desc'},
     chips:[{id:'', label:'All'},{id:'open', label:'Out now', where:'(return_date IS NULL OR return_date="")'},{id:'ret', label:'Returned', where:'return_date<>""'}]
   },
   items: { table:'items', label:'Stock items', singular:'Item', icon:ICONS.box, group:'Inventory',
@@ -1597,11 +1614,12 @@ const ENTITIES = {
       {key:'category', label:'Category', type:'select', options:EXPENSE_CATS, required:true, badge:true, w:130},
       {key:'asset_type', label:'For', type:'select', options:['','Vehicle','Equipment'], w:90},
       {key:'asset_ref', label:'Vehicle / equipment', type:'combo', mono:true, dependsOn:'asset_type', optionsFn:(vals)=> vals.asset_type ? assetLabels(vals.asset_type) : [], parse:parseAssetRef, display:(r)=>r.asset_ref?assetLabelFor(r.asset_type,r.asset_ref):'', w:150},
-      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), w:120},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:120, hint:'Picking a team fills the project'},
+      {key:'project', label:'Project', type:'combo', optionsFn:()=>projectNames(), w:140, hint:'Which project this cost belongs to — used by the per-project cost analysis'},
       {key:'amount', label:'Amount (BD)', type:'money', required:true, w:110, num:true},
       {key:'note', label:'Note', type:'text', w:220}
     ],
-    search:['category','asset_ref','team','note'], dateField:'date', defaultSort:{field:'date', dir:'desc'},
+    search:['category','asset_ref','team','project','note'], dateField:'date', defaultSort:{field:'date', dir:'desc'},
     chips:[{id:'', label:'All'},{id:'fuel', label:'Fuel', where:'category="Fuel"'},{id:'other', label:'Other', where:'category<>"Fuel"'}]
   },
   drivers: { table:'drivers', label:'Drivers', singular:'Driver', icon:ICONS.users, group:'People',
@@ -1840,7 +1858,7 @@ function renderTable(key){
     else if(act==='detail') openAssetDrawer(b.dataset.type||cfg.detail, b.dataset.ref);
     else if(act==='move') openMovementFor(cfg.detail, b.dataset.ref);
     else if(act==='tomaint') openForm('maintenance', null, {asset_type:cfg.detail, asset_ref:b.dataset.ref});
-    else if(act==='toggle') toggleCost(key, id);
+    else if(act==='toggle') toggleCost(key, id, b.dataset.col||'count_cost');
   });
   spacer.addEventListener('dblclick', (e)=>{ const r=e.target.closest('.tr'); if(r) openForm(key, Number(r.dataset.id)); });
   thead.querySelectorAll('.th[data-field]').forEach(th=> th.addEventListener('click', ()=>{
@@ -1881,12 +1899,20 @@ function badgeTone(key, col, val){
 }
 function cellHtml(key, c, r){
   let v = r[c.key];
-  if(c.type==='toggle'){ const on = Number(v)!==0; return `<button class="pill-toggle ${on?'on':'off'}" data-act="toggle" data-id="${r.id}" title="${on?'Counted in cost — click to exclude':'Excluded from cost — click to include'}"><span class="dot"></span>${on?'On':'Off'}</button>`; }
+  if(c.type==='toggle'){ const on = Number(v)!==0; const what = c.key==='count_util' ? 'utilisation' : 'cost'; return `<button class="pill-toggle ${on?'on':'off'}" data-act="toggle" data-id="${r.id}" data-col="${c.key}" title="${on?'Counted in '+what+' — click to exclude':'Excluded from '+what+' — click to include'}"><span class="dot"></span>${on?'On':'Off'}</button>`; }
   if(c.salary){ const s=salaryOf(r.card_no); return s ? `<span class="mono">${money(s)}</span>` : `<span class="muted">—</span>`; }
   if(key==='vehicles' && c.key==='driver'){
     const live = qv(`SELECT driver FROM vehicle_moves WHERE vno=? AND (return_date IS NULL OR return_date='') ORDER BY date_out DESC, id DESC LIMIT 1`,[r.vno]);
     if(live) return `${esc(live)} <span class="badge info" style="font-size:10px;padding:1px 6px" title="Current driver from the open movement in Vehicle log"><span class="dot"></span>now</span>`;
     return r.driver ? esc(r.driver) : '<span class="muted">—</span>';
+  }
+  if((key==='vehicles'||key==='equipment') && (c.key==='team'||c.key==='project')){
+    const live = key==='vehicles'
+      ? q1(`SELECT team, project FROM vehicle_moves WHERE vno=? AND (return_date IS NULL OR return_date='') ORDER BY date_out DESC, id DESC LIMIT 1`,[r.vno])
+      : q1(`SELECT team, project FROM equipment_moves WHERE item=? AND (serial=? OR ?='') AND (return_date IS NULL OR return_date='') ORDER BY date_out DESC, id DESC LIMIT 1`,[r.item, r.serial||'', r.serial||'']);
+    const lv = live && live[c.key];
+    if(lv) return `${esc(lv)}${lv!==(v||'') ? ` <span class="badge info" style="font-size:10px;padding:1px 6px" title="From the open movement — the register says ${esc(v||'—')}"><span class="dot"></span>now</span>`:''}`;
+    return v ? esc(v) : '<span class="muted">—</span>';
   }
   if(c.badge && c.key==='status' && (key==='vehicles'||key==='equipment')){
     const type = key==='vehicles'?'Vehicle':'Equipment', ref = key==='vehicles'?r.vno:r.no;
@@ -1954,10 +1980,12 @@ function openMovementFor(type, ref){
     openForm('equipment_moves', null, {item:e.item, serial:e.serial||''});
   }
 }
-async function toggleCost(key, id){
-  const cfg = ENTITIES[key]; const cur = qv(`SELECT count_cost FROM ${cfg.table} WHERE id=?`,[id]);
-  await mutate(()=> run(`UPDATE ${cfg.table} SET count_cost=? WHERE id=?`,[cur?0:1, id]));
-  toast(cur?'Excluded from cost analysis & utilisation':'Now counted in cost analysis', cur?'warn':'good');
+async function toggleCost(key, id, col){
+  col = col==='count_util' ? 'count_util' : 'count_cost';
+  const cfg = ENTITIES[key]; const cur = qv(`SELECT ${col} FROM ${cfg.table} WHERE id=?`,[id]);
+  await mutate(()=> run(`UPDATE ${cfg.table} SET ${col}=? WHERE id=?`,[cur?0:1, id]));
+  const what = col==='count_util' ? 'the Utilisation report' : 'cost analysis';
+  toast(cur?'Excluded from '+what:'Now counted in '+what, cur?'warn':'good');
   render();
 }
 
@@ -2036,7 +2064,7 @@ function openForm(key, id, presets){
   // dependency edges
   cols.forEach(c=>{
     const edges = [];
-    if(c.linkTo) edges.push(()=>{ const src=document.getElementById(`f-${c.key}`).value; const t=document.getElementById(`f-${c.linkTo.target}`); const r=q1(`SELECT ${c.linkTo.value} AS v FROM ${c.linkTo.table} WHERE ${c.linkTo.match}=? LIMIT 1`,[src]); if(r&&t&&(r.v||'')!=='') t.value=r.v; if(combos[c.linkTo.target]) combos[c.linkTo.target].refresh(); });
+    if(c.linkTo) edges.push(()=>{ const src=document.getElementById(`f-${c.key}`).value; const t=document.getElementById(`f-${c.linkTo.target}`); const r=q1(`SELECT ${c.linkTo.value} AS v FROM ${c.linkTo.table} WHERE ${c.linkTo.match}=? LIMIT 1`,[src]); if(r&&t&&(r.v||'')!=='' && t.value!==r.v){ t.value=r.v; t.dispatchEvent(new Event('change')); } if(combos[c.linkTo.target]) combos[c.linkTo.target].refresh(); });
     cols.filter(d=>d.dependsOn===c.key).forEach(d=> edges.push(()=>{ if(combos[d.key]) combos[d.key].refresh(); const opts=computeOptions(d,current()); const t=document.getElementById(`f-${d.key}`); if(opts.length===1 && t && !t.value) t.value=opts[0]; }));
     if(edges.length){ const el=document.getElementById(`f-${c.key}`); const fire=()=>edges.forEach(f=>f()); el.addEventListener('input', fire); el.addEventListener('change', fire); }
   });
@@ -2142,6 +2170,7 @@ function openAssetDrawer(type, ref, tab){
       <div><small>Hire rate</small>${Number(a.rental_rate)?`<span class="mono" style="font-weight:600">${money(a.rental_rate)}</span> ${CURRENCY} / ${esc(a.rental_basis||'month')}`:'<span class="muted">Not set — edit the record</span>'}</div>
       <div><small>Rate is per</small>${esc(a.rental_basis||'month')}</div>
       <div><small>Counted in cost</small>${Number(a.count_cost)!==0?'<span class="badge good"><span class="dot"></span>Yes</span>':'<span class="badge neutral"><span class="dot"></span>No — excluded</span>'}</div>
+      <div><small>Counted in utilisation</small>${Number(a.count_util)!==0?'<span class="badge good"><span class="dot"></span>Yes</span>':'<span class="badge neutral"><span class="dot"></span>No — excluded</span>'}</div>
       <div><small>Hire cost this year</small><span class="mono" style="font-weight:600">${money(rentYear)}</span> ${CURRENCY}</div>
       <div><small>Fuel & expenses this year</small><span class="mono" style="font-weight:600">${money(fuelYear)}</span> ${CURRENCY}</div>
       <div><small>Days used this year</small>${usedYear} of ${daysY} (${daysY?Math.round(usedYear/daysY*100):0}% utilisation)</div>
@@ -2290,7 +2319,7 @@ function costSummary(from, to, opts){
   hireTot.total = hireTot.veh+hireTot.eq;
   // expenses
   const expByCat = PJ ? [] : q('SELECT category, COUNT(*) n, SUM(amount) amount FROM expenses WHERE date>=? AND date<=? GROUP BY category ORDER BY amount DESC',[from,to]);
-  let expRows = q('SELECT x.*, COALESCE(NULLIF(x.team,""), v.team, e.team, "Unallocated") team2, COALESCE(v.project, e.project, "") project FROM expenses x LEFT JOIN vehicles v ON x.asset_type="Vehicle" AND v.vno=x.asset_ref LEFT JOIN equipment e ON x.asset_type="Equipment" AND e.no=x.asset_ref WHERE x.date>=? AND x.date<=? ORDER BY x.date DESC',[from,to]);
+  let expRows = q('SELECT x.*, COALESCE(NULLIF(x.team,""), v.team, e.team, "Unallocated") team2, COALESCE(NULLIF(x.project,""), v.project, e.project, "") project FROM expenses x LEFT JOIN vehicles v ON x.asset_type="Vehicle" AND v.vno=x.asset_ref LEFT JOIN equipment e ON x.asset_type="Equipment" AND e.no=x.asset_ref WHERE x.date>=? AND x.date<=? ORDER BY x.date DESC',[from,to]);
   if(PJ) expRows = expRows.filter(r=>r.project===PJ);
   if(PJ){ const m={}; expRows.forEach(r=>{ const c=m[r.category]=m[r.category]||{category:r.category,n:0,amount:0}; c.n++; c.amount+=Number(r.amount||0); }); expByCat.push(...Object.values(m).sort((a,b)=>b.amount-a.amount)); }
   const expTot = expRows.reduce((s,r)=>s+Number(r.amount||0),0);
@@ -2670,22 +2699,23 @@ function renderMaintReport(){
 }
 
 /* ===================================================================== Excel round-trip */
-const SHEETS = { daily_usage:'Daily Usage', drivers:'Driver Name', vehicles:'Vehicle', vehicle_moves:'Vehicle Movement', equipment:'Equipment', equipment_moves:'Equipment Movement', items:'ITEMS', stock_moves:'MOVEMENT', maintenance:'Maintenance', employees:'Employees', attendance:'Timesheet', work_log:'Work Log', expenses:'Expenses', departments:'Departments' };
+const SHEETS = { daily_usage:'Daily Usage', drivers:'Driver Name', vehicles:'Vehicle', vehicle_moves:'Vehicle Movement', equipment:'Equipment', equipment_moves:'Equipment Movement', items:'ITEMS', stock_moves:'MOVEMENT', maintenance:'Maintenance', employees:'Employees', attendance:'Timesheet', work_log:'Work Log', expenses:'Expenses', teams:'Teams', departments:'Departments' };
 const SER = 'Serial No \\ Chassis No';
 const XMAP = {
   daily_usage:{date:'Date', asset_type:'Asset Type', asset_ref:'Asset Ref', asset_name:'Asset', status:'Status', team:'Team', location:'Location', issued_to:'Issued To', hours:'Hours', note:'Note'},
   drivers:{no:'No', card_no:'Card No', name:'Name', cpr:'CPR'},
-  vehicles:{vno:'VEHICLE NO.', type:'TYPE', model:'MODEL', team:'TEAM', driver:'Name', status:'Status', site:'Site', rental_rate:'Hire Rate', rental_basis:'Rate Per', count_cost:'Count In Cost', notes:'Notes'},
-  vehicle_moves:{date_out:'Date Out', time_out:'Time Out', vno:'VEHICLE NO.', cpr:'CPR', driver:'Name', return_date:'Return Date', return_time:'Return Time', purpose:'Purpose'},
-  equipment:{no:'No', item:'Item', serial:SER, fuel:'Fuel Type', status:'Status', team:'Team', rental_rate:'Hire Rate', rental_basis:'Rate Per', count_cost:'Count In Cost', notes:'Notes'},
-  equipment_moves:{item:'Item', serial:SER, date_out:'Date Out', time_out:'Time Out', department:'Department', assigned:'Assigned Vehicle No', issued_to:'Issued To', return_date:'Return Date', return_time:'Return Time'},
+  vehicles:{vno:'VEHICLE NO.', type:'TYPE', model:'MODEL', team:'TEAM', project:'Project', driver:'Name', status:'Status', site:'Site', rental_rate:'Hire Rate', rental_basis:'Rate Per', count_cost:'Count In Cost', count_util:'Count In Utilisation', notes:'Notes'},
+  vehicle_moves:{date_out:'Date Out', time_out:'Time Out', vno:'VEHICLE NO.', cpr:'CPR', driver:'Name', team:'Team', project:'Project', return_date:'Return Date', return_time:'Return Time', purpose:'Purpose'},
+  equipment:{no:'No', item:'Item', serial:SER, fuel:'Fuel Type', status:'Status', team:'Team', project:'Project', rental_rate:'Hire Rate', rental_basis:'Rate Per', count_cost:'Count In Cost', count_util:'Count In Utilisation', notes:'Notes'},
+  equipment_moves:{item:'Item', serial:SER, date_out:'Date Out', time_out:'Time Out', department:'Department', assigned:'Assigned Vehicle No', team:'Team', project:'Project', issued_to:'Issued To', return_date:'Return Date', return_time:'Return Time'},
   items:{no:'No', name:'ITEM NAME', start_qty:'Start Quantity', qty_in:'In', qty_out:'Out', current:'Updated Quantity', min_stock:'Minimum Stock', unit_cost:'Unit Cost', unit:'Unit', category:'Category'},
   stock_moves:{date:'Date', type:'Type', item_name:'ITEM NAME', qty:'Qty', location:'Notes2', vehicle_no:'Notes3', remark:'Remark', unit_cost:'Unit Cost'},
   maintenance:{asset_type:'Asset Type', asset_ref:'Asset Ref', asset_name:'Asset', date_out:'Sent', return_date:'Returned', reason:'Reason'},
-  employees:{card_no:'Card No', name:'Name', cpr:'CPR', occupation:'Occupation', team:'Team', timing:'Timing', status:'Status', notes:'Notes'},
+  employees:{card_no:'Card No', name:'Name', cpr:'CPR', occupation:'Occupation', team:'Team', project:'Project', timing:'Timing', status:'Status', notes:'Notes'},
   attendance:{date:'Date', card_no:'Card No', name:'Name', occupation:'Occupation', type_day:'Type Day', start_time:'Start Time', normal_hours:'Normal', ot_hours:'Final', extra:'Extra', food:'Food', hours:'Hours', time_in:'In', time_out:'Out', status:'Attendance', remarks:'Remarks'},
   work_log:{date:'Date', work_order:'Work Order No.', requested_by:'Requested By', location:'Location', category:'Work Category', description:'Work Description', team:'Team', status:'Job Status', qty:'Qty', hours:'Duration (Hrs)', amount:'Work Done Amount (BD)', materials:'Site Details / Materials Used', follow_up:'Follow-up Required'},
-  expenses:{date:'Date', category:'Category', asset_type:'Asset Type', asset_ref:'Asset Ref', team:'Team', amount:'Amount', note:'Note'},
+  expenses:{date:'Date', category:'Category', asset_type:'Asset Type', asset_ref:'Asset Ref', team:'Team', project:'Project', amount:'Amount', note:'Note'},
+  teams:{team:'Team', project:'Project', note:'Note'},
   departments:{department:'Department', inside:'INSIDE'}
 };
 /* Excel dates arrive as serial numbers (cellDates:false) — converted with SSF, so the PC time zone can never shift the day.
@@ -2751,10 +2781,10 @@ async function importWorkbook(file){
       await mutate(()=>{
         const has = n=> wb.SheetNames.some(x=>x.trim().toLowerCase()===n.toLowerCase());
         if(has('Driver Name')){ run('DELETE FROM drivers'); rowsOf(wb,'Driver Name').forEach(r=> insertRow('drivers',{no:N(r['No']), card_no:S(r['Card No']), name:S(r['Name']), cpr:S(r['CPR'])})); }
-        if(has('Vehicle')){ run('DELETE FROM vehicles'); rowsOf(wb,'Vehicle').forEach(r=>{ if(!S(r['VEHICLE NO.'])) return; insertRow('vehicles',{vno:S(r['VEHICLE NO.']), type:S(r['TYPE']), model:S(r['MODEL']), team:S(r['TEAM']), driver:S(r['Name']), status:S(r['Status'])||'GOOD', site:S(r['Site']), rental_rate:N(g(r,'Hire Rate','Rent per Month')), rental_basis:S(r['Rate Per'])||'month', count_cost:(S(r['Count In Cost'])==='0'||/^(no|false|off)$/i.test(S(r['Count In Cost'])))?0:1, notes:S(r['Notes'])}); }); }
-        if(has('Vehicle Movement')){ run('DELETE FROM vehicle_moves'); rowsOf(wb,'Vehicle Movement').forEach(r=>{ if(!S(r['VEHICLE NO.'])) return; insertRow('vehicle_moves',{date_out:xlDate(r['Date Out']), time_out:xlTime(r['Time Out']), vno:S(r['VEHICLE NO.']), cpr:S(r['CPR']), driver:S(r['Name']), return_date:xlDate(r['Return Date']), return_time:xlTime(r['Return Time']), purpose:S(r['Purpose'])}); }); }
-        if(has('Equipment')){ run('DELETE FROM equipment'); rowsOf(wb,'Equipment').forEach(r=>{ if(!S(r['Item'])) return; insertRow('equipment',{no:S(r['No']), item:S(r['Item']), serial:nn(r[SER]), fuel:nn(r['Fuel Type'])||'N/A', status:S(r['Status']), team:S(r['Team']), rental_rate:N(g(r,'Hire Rate','Rent per Month')), rental_basis:S(r['Rate Per'])||'month', count_cost:(S(r['Count In Cost'])==='0'||/^(no|false|off)$/i.test(S(r['Count In Cost'])))?0:1, notes:S(r['Notes'])}); }); }
-        if(has('Equipment Movement')){ run('DELETE FROM equipment_moves'); rowsOf(wb,'Equipment Movement').forEach(r=>{ if(!S(r['Item'])) return; insertRow('equipment_moves',{item:S(r['Item']), serial:nn(r[SER]), date_out:xlDate(r['Date Out']), time_out:xlTime(r['Time Out']), department:S(r['Department']), assigned:S(r['Assigned Vehicle No']), issued_to:S(r['Issued To']), return_date:xlDate(r['Return Date']), return_time:xlTime(r['Return Time'])}); }); }
+        if(has('Vehicle')){ run('DELETE FROM vehicles'); rowsOf(wb,'Vehicle').forEach(r=>{ if(!S(r['VEHICLE NO.'])) return; insertRow('vehicles',{vno:S(r['VEHICLE NO.']), type:S(r['TYPE']), model:S(r['MODEL']), team:S(r['TEAM']), project:S(r['Project']), driver:S(r['Name']), status:S(r['Status'])||'GOOD', site:S(r['Site']), rental_rate:N(g(r,'Hire Rate','Rent per Month')), rental_basis:S(r['Rate Per'])||'month', count_cost:(S(r['Count In Cost'])==='0'||/^(no|false|off)$/i.test(S(r['Count In Cost'])))?0:1, count_util:(S(r['Count In Utilisation'])==='0'||/^(no|false|off)$/i.test(S(r['Count In Utilisation'])))?0:1, notes:S(r['Notes'])}); }); }
+        if(has('Vehicle Movement')){ run('DELETE FROM vehicle_moves'); rowsOf(wb,'Vehicle Movement').forEach(r=>{ if(!S(r['VEHICLE NO.'])) return; insertRow('vehicle_moves',{date_out:xlDate(r['Date Out']), time_out:xlTime(r['Time Out']), vno:S(r['VEHICLE NO.']), cpr:S(r['CPR']), driver:S(r['Name']), return_date:xlDate(r['Return Date']), return_time:xlTime(r['Return Time']), purpose:S(r['Purpose']), team:S(r['Team']), project:S(r['Project'])}); }); }
+        if(has('Equipment')){ run('DELETE FROM equipment'); rowsOf(wb,'Equipment').forEach(r=>{ if(!S(r['Item'])) return; insertRow('equipment',{no:S(r['No']), item:S(r['Item']), serial:nn(r[SER]), fuel:nn(r['Fuel Type'])||'N/A', status:S(r['Status']), team:S(r['Team']), project:S(r['Project']), rental_rate:N(g(r,'Hire Rate','Rent per Month')), rental_basis:S(r['Rate Per'])||'month', count_cost:(S(r['Count In Cost'])==='0'||/^(no|false|off)$/i.test(S(r['Count In Cost'])))?0:1, count_util:(S(r['Count In Utilisation'])==='0'||/^(no|false|off)$/i.test(S(r['Count In Utilisation'])))?0:1, notes:S(r['Notes'])}); }); }
+        if(has('Equipment Movement')){ run('DELETE FROM equipment_moves'); rowsOf(wb,'Equipment Movement').forEach(r=>{ if(!S(r['Item'])) return; insertRow('equipment_moves',{item:S(r['Item']), serial:nn(r[SER]), date_out:xlDate(r['Date Out']), time_out:xlTime(r['Time Out']), department:S(r['Department']), assigned:S(r['Assigned Vehicle No']), issued_to:S(r['Issued To']), team:S(r['Team'])||S(r['Issued To']), project:S(r['Project']), return_date:xlDate(r['Return Date']), return_time:xlTime(r['Return Time'])}); }); }
         if(has('ITEMS')||has('MOVEMENT')){ run('DELETE FROM stock_moves'); run('DELETE FROM items');
           (rowsOf(wb,'ITEMS')||[]).forEach(r=>{ const name=S(r['ITEM NAME']); if(!name) return; run('INSERT OR IGNORE INTO items(no,name,start_qty,qty_in,qty_out,current,min_stock,unit_cost,unit,category) VALUES(?,?,?,0,0,?,?,?,?,?)',[N(r['No']),name,N(r['Start Quantity']),N(r['Start Quantity']),N(r['Minimum Stock']),N(r['Unit Cost']),S(r['Unit']),S(r['Category'])]); });
           (rowsOf(wb,'MOVEMENT')||[]).forEach(r=>{ const name=S(r['ITEM NAME']); if(!name) return; run('INSERT OR IGNORE INTO items(name,start_qty,current) VALUES(?,0,0)',[name]); insertRow('stock_moves',{date:xlDate(r['Date']), type:S(r['Type'])||'Out', item_name:name, qty:N(r['Qty']), location:S(r['Notes2']), vehicle_no:S(r['Notes3']), remark:S(r['Remark']), unit_cost:N(r['Unit Cost'])}); }); }
@@ -2762,8 +2792,9 @@ async function importWorkbook(file){
         if(has('Employees')){ run('DELETE FROM employees'); rowsOf(wb,'Employees').forEach(r=> upsertEmployee(r)); }
         if(has('Timesheet')){ run('DELETE FROM attendance'); rowsOf(wb,'Timesheet').forEach(r=> upsertAttendance(r)); }
         if(has('Work Log')){ run('DELETE FROM work_log'); rowsOf(wb,'Work Log').forEach(r=> insertWork(r)); }
-        if(has('Expenses')){ run('DELETE FROM expenses'); rowsOf(wb,'Expenses').forEach(r=>{ if(!N(r['Amount'])&&!S(r['Category'])) return; insertRow('expenses',{date:xlDate(r['Date']), category:S(r['Category'])||'Other', asset_type:S(r['Asset Type']), asset_ref:S(r['Asset Ref']), team:S(r['Team']), amount:N(r['Amount']), note:S(r['Note'])}); }); }
+        if(has('Expenses')){ run('DELETE FROM expenses'); rowsOf(wb,'Expenses').forEach(r=>{ if(!N(r['Amount'])&&!S(r['Category'])) return; insertRow('expenses',{date:xlDate(r['Date']), category:S(r['Category'])||'Other', asset_type:S(r['Asset Type']), asset_ref:S(r['Asset Ref']), team:S(r['Team']), project:S(r['Project']), amount:N(r['Amount']), note:S(r['Note'])}); }); }
         if(has('Daily Usage')){ run('DELETE FROM daily_usage'); rowsOf(wb,'Daily Usage').forEach(r=>{ if(!S(r['Asset Ref'])||!xlDate(r['Date'])) return; run('INSERT OR IGNORE INTO daily_usage(date,asset_type,asset_ref,asset_name,status,team,location,issued_to,hours,note) VALUES(?,?,?,?,?,?,?,?,?,?)',[xlDate(r['Date']),S(r['Asset Type'])||'Equipment',S(r['Asset Ref']),S(r['Asset']),S(r['Status'])||'Idle',S(r['Team']),S(r['Location']),S(r['Issued To']),N(r['Hours']),S(r['Note'])]); }); }
+        if(has('Teams')){ run('DELETE FROM teams'); rowsOf(wb,'Teams').forEach(r=>{ if(S(r['Team'])) insertRow('teams',{team:S(r['Team']), project:S(r['Project']), note:S(r['Note'])}); }); }
         if(has('Departments')){ run('DELETE FROM departments'); rowsOf(wb,'Departments').forEach(r=>{ if(S(r['Department'])) insertRow('departments',{department:S(r['Department']), inside:S(r['INSIDE'])}); }); }
       });
       VIEW='dashboard'; render(); toast('Workbook imported','good');
@@ -3015,12 +3046,12 @@ function renderUtilisation(){
       (SELECT COUNT(DISTINCT date_out) FROM vehicle_moves m WHERE m.vno=v.vno AND m.date_out>=? ) uses,
       (SELECT MAX(date_out) FROM vehicle_moves m WHERE m.vno=v.vno) last_out,
       (SELECT COUNT(*) FROM vehicle_moves m WHERE m.vno=v.vno AND (m.return_date IS NULL OR m.return_date='')) open
-      FROM vehicles v WHERE COALESCE(v.count_cost,1)=1`,[from]).map(r=>({...r, kind:'Vehicle', label:`${r.ref} · ${r.model||r.type||''}`}));
+      FROM vehicles v WHERE COALESCE(v.count_util,1)=1`,[from]).map(r=>({...r, kind:'Vehicle', label:`${r.ref} · ${r.model||r.type||''}`}));
   const eqRows = q(`SELECT e.no ref, e.item, e.serial, e.team, e.status, e.rental_rate, e.rental_basis,
       (SELECT COUNT(DISTINCT m.date_out) FROM equipment_moves m WHERE m.item=e.item AND (m.serial=e.serial OR e.serial='' OR e.serial IS NULL) AND m.date_out>=?) uses,
       (SELECT MAX(m.date_out) FROM equipment_moves m WHERE m.item=e.item AND (m.serial=e.serial OR e.serial='' OR e.serial IS NULL)) last_out,
       (SELECT COUNT(*) FROM equipment_moves m WHERE m.item=e.item AND (m.serial=e.serial OR e.serial='' OR e.serial IS NULL) AND (m.return_date IS NULL OR m.return_date='')) open
-      FROM equipment e WHERE COALESCE(e.count_cost,1)=1`,[from]).map(r=>({...r, kind:'Equipment', label:`${r.ref} · ${r.item}`}));
+      FROM equipment e WHERE COALESCE(e.count_util,1)=1`,[from]).map(r=>({...r, kind:'Equipment', label:`${r.ref} · ${r.item}`}));
   let rows = vehRows.concat(eqRows).map(r=>{
     const days = w;
     r.uses = r.kind==='Vehicle' ? assetUsedDays('Vehicle', q1('SELECT * FROM vehicles WHERE vno=?',[r.ref]), from, to) : assetUsedDays('Equipment', q1('SELECT * FROM equipment WHERE no=?',[r.ref]), from, to);

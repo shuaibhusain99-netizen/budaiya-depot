@@ -637,7 +637,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
      again so the screen never shows a stale copy.
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -781,6 +781,8 @@ function migrate(){
   run("UPDATE vehicles SET project=CASE WHEN lower(COALESCE(site,'')) LIKE '%isa town%' THEN 'Isa Town Depot' ELSE 'Budaiya Depot' END WHERE project IS NULL OR project=''");
   run("UPDATE equipment SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
   run("UPDATE employees SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
+  // v11: richer maintenance records
+  [['maint_type','TEXT'],['workshop','TEXT'],['meter','REAL'],['work_done','TEXT'],['parts','TEXT'],['cost_parts','REAL DEFAULT 0'],['cost_labour','REAL DEFAULT 0'],['invoice_no','TEXT'],['next_due','TEXT'],['next_due_meter','REAL'],['note','TEXT']].forEach(([c,t])=>{ if(!hasColumn('maintenance',c)) run(`ALTER TABLE maintenance ADD COLUMN ${c} ${t}`); });
   // v10: movements carry team + project; expenses carry project; utilisation has its own switch
   [['vehicle_moves','team'],['vehicle_moves','project'],['equipment_moves','team'],['equipment_moves','project'],['expenses','project']].forEach(([t,c])=>{ if(!hasColumn(t,c)) run(`ALTER TABLE ${t} ADD COLUMN ${c} TEXT`); });
   ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'count_util')){ run(`ALTER TABLE ${t} ADD COLUMN count_util INTEGER DEFAULT 1`); run(`UPDATE ${t} SET count_util=COALESCE(count_cost,1)`); } });
@@ -1420,6 +1422,7 @@ const RATE_BASIS = ['month','day','hour'];
 const WORK_CATEGORIES = ['Metering Work','Metering Inspection','New Connection Work','New Connection Inspection','Emergency Maintenance Work','Valve Maintenance','Leak Detection Works','Depot Work','Other'];
 const JOB_STATUS = ['Completed','Partially Completed','Postponed','Not Completed - Access','Not Completed - Address','Cancelled','PENDING'];
 const ATT_STATUS = ['Working','Absent','Vacation','Sick Leave','Other Section','Off day'];
+const MAINT_TYPES = ['Breakdown repair','Preventive service','Accident repair','Inspection / test','Tyres','Electrical','Body / paint','Other'];
 const EXPENSE_CATS = ['Fuel','Materials','Repair (external)','Transport','Permit / fees','Other'];
 function projectNames(){ const set=new Set(String(getSetting('projects','')).split('\n').map(x=>x.trim()).filter(Boolean)); q('SELECT project p FROM vehicles UNION SELECT project FROM equipment UNION SELECT project FROM employees UNION SELECT project FROM teams').forEach(r=>{ if(r.p) set.add(r.p); }); return [...set].sort(); }
 const PROJECT_COL = {key:'project', label:'Project', type:'combo', required:true, optionsFn:()=>projectNames(), default:()=>getSetting('default_project','Budaiya Depot'), w:130, hint:'Which depot / project this belongs to — cost analysis can be filtered per project. Type a new name to create a project.'};
@@ -1529,17 +1532,36 @@ const ENTITIES = {
     chips:[{id:'', label:'All'},{id:'out', label:'Issued (Out)', where:'lower(type)="out"'},{id:'in', label:'Received (In)', where:'lower(type)="in"'}]
   },
   maintenance: { table:'maintenance', label:'Maintenance', singular:'Maintenance entry', icon:ICONS.wrench, group:'Maintenance', log:true,
+    select:`SELECT maintenance.*, COALESCE(cost_parts,0)+COALESCE(cost_labour,0) cost_total,
+      COALESCE((SELECT v.team FROM vehicles v WHERE maintenance.asset_type='Vehicle' AND v.vno=maintenance.asset_ref),(SELECT e.team FROM equipment e WHERE maintenance.asset_type='Equipment' AND e.no=maintenance.asset_ref),'') team,
+      COALESCE((SELECT v.project FROM vehicles v WHERE maintenance.asset_type='Vehicle' AND v.vno=maintenance.asset_ref),(SELECT e.project FROM equipment e WHERE maintenance.asset_type='Equipment' AND e.no=maintenance.asset_ref),'') project,
+      CAST(julianday(COALESCE(NULLIF(return_date,''),date('now'))) - julianday(date_out) AS INTEGER) days_away FROM maintenance`,
     columns:[
       {key:'asset_type', label:'Asset type', type:'select', options:['Vehicle','Equipment'], required:true, w:100, badge:true},
       {key:'asset_ref', label:'Vehicle / equipment', type:'combo', required:true, mono:true, dependsOn:'asset_type', optionsFn:(vals)=> assetLabels(vals.asset_type||'Vehicle'), parse:parseAssetRef, display:(r)=>assetLabelFor(r.asset_type,r.asset_ref), w:120, hint:'Type the number, name or serial — the list shows "No.  —  Item (serial / chassis)"'},
-      {key:'asset_name', label:'Asset', type:'text', w:260, computed:true},
-      {key:'date_out', label:'Sent for maintenance', type:'date', required:true, w:140, default:()=>todayStr()},
-      {key:'return_date', label:'Returned on', type:'date', w:120, hint:'Leave empty until it comes back'},
-      {key:'reason', label:'Reason', type:'textarea', required:true, w:320, span2:true}
+      {key:'asset_name', label:'Asset', type:'text', w:220, computed:true, inTable:true},
+      {key:'team', label:'Team', type:'text', w:110, computed:true, inTable:true},
+      {key:'project', label:'Project', type:'text', w:120, computed:true, inTable:true},
+      {key:'maint_type', label:'Type', type:'select', options:MAINT_TYPES, required:true, w:140, badge:true, default:()=>'Breakdown repair'},
+      {key:'date_out', label:'Sent', type:'date', required:true, w:110, default:()=>todayStr()},
+      {key:'return_date', label:'Returned', type:'date', w:110, hint:'Leave empty until it comes back'},
+      {key:'days_away', label:'Days', type:'number', w:65, num:true, computed:true, inTable:true},
+      {key:'workshop', label:'Workshop / garage', type:'combo', optionsFn:()=>q('SELECT DISTINCT workshop v FROM maintenance WHERE COALESCE(workshop,\'\')<>\'\' ORDER BY 1').map(r=>r.v), w:150},
+      {key:'meter', label:'Odometer / hours', type:'number', w:110, num:true, hint:'km for vehicles, running hours for equipment — at the time it was sent'},
+      {key:'reason', label:'Reason / fault', type:'textarea', required:true, w:240, span2:true},
+      {key:'work_done', label:'Work carried out', type:'textarea', w:240, span2:true, section:'Work & cost', hideInTable:true},
+      {key:'parts', label:'Parts replaced', type:'text', w:200, span2:true, hideInTable:true},
+      {key:'cost_parts', label:'Parts cost', type:'money', w:100, num:true},
+      {key:'cost_labour', label:'Labour cost', type:'money', w:100, num:true},
+      {key:'cost_total', label:'Total cost', type:'money', w:100, num:true, computed:true, inTable:true},
+      {key:'invoice_no', label:'Invoice / job card no.', type:'text', mono:true, w:130, hideInTable:true},
+      {key:'next_due', label:'Next service due', type:'date', w:120, section:'Next service', hint:'Shows red when overdue, amber within 7 days'},
+      {key:'next_due_meter', label:'Next service at (km / hrs)', type:'number', w:120, num:true, hideInTable:true},
+      {key:'note', label:'Note', type:'text', w:200, hideInTable:true}
     ],
     statusOf: r=> r.return_date ? {label:'Returned', tone:'good'} : {label:'In maint.', tone:'warn'},
-    search:['asset_ref','asset_name','reason'], dateField:'date_out', defaultSort:{field:'date_out', dir:'desc'},
-    chips:[{id:'', label:'All'},{id:'open', label:'In maintenance now', where:'(return_date IS NULL OR return_date="")'},{id:'veh', label:'Vehicles', where:'asset_type="Vehicle"'},{id:'eq', label:'Equipment', where:'asset_type="Equipment"'}]
+    search:['asset_ref','asset_name','reason','workshop','maint_type','parts','invoice_no','work_done'], dateField:'date_out', defaultSort:{field:'date_out', dir:'desc'},
+    chips:[{id:'', label:'All'},{id:'open', label:'In maintenance now', where:'(return_date IS NULL OR return_date="")'},{id:'veh', label:'Vehicles', where:'asset_type="Vehicle"'},{id:'eq', label:'Equipment', where:'asset_type="Equipment"'},{id:'due', label:'Service due / overdue', where:'COALESCE(next_due,"")<>"" AND next_due<=date("now","+7 days")'}]
   },
   work_log: { table:'work_log', label:'Jobs (BOQ)', singular:'Job', icon:ICONS.report, group:'Cost', log:true,
     columns:[
@@ -1893,6 +1915,7 @@ function badgeTone(key, col, val){
     if(v.includes('out of service')) return 'bad';
     return 'info';
   }
+  if(col==='maint_type') return v.includes('preventive')||v.includes('inspection') ? 'good' : v.includes('accident') ? 'bad' : 'warn';
   if(col==='type') return v==='in' ? 'good' : 'bad';
   if(col==='asset_type') return v==='vehicle' ? 'info' : 'neutral';
   return 'info';
@@ -2161,7 +2184,7 @@ function openAssetDrawer(type, ref, tab){
       const d = m.return_date ? Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)) : daysSince(m.date_out);
       return `<tr><td class="mono">${esc(m.date_out)} ${esc(m.time_out||'')}</td><td>${esc(isV?m.driver:m.department)}</td><td>${esc(isV?(m.purpose||''):[m.assigned,m.issued_to].filter(Boolean).join(' · '))}</td><td>${m.return_date?`<span class="mono">${esc(m.return_date)} ${esc(m.return_time||'')}</span>`:'<span class="badge bad"><span class="dot"></span>Out</span>'}</td><td class="num mono">${d??''}</td></tr>`;}).join('')}</tbody></table></div>` : `<div class="empty-row">No movements recorded.</div>`;
   } else if(DRAWER_TAB==='maint'){
-    body = `<div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary btn-sm" id="dr-add-maint">${ICONS.plus}Send for maintenance</button></div>` + (mt.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>Sent</th><th>Returned</th><th class="num">Days</th><th>Reason</th><th></th></tr></thead><tbody>${mt.map(m=>{ const d = m.return_date ? Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)) : daysSince(m.date_out); return `<tr><td class="mono">${esc(m.date_out)}</td><td>${m.return_date?`<span class="mono">${esc(m.return_date)}</span>`:'<span class="badge warn"><span class="dot"></span>In maintenance</span>'}</td><td class="num mono">${d}</td><td class="wrap">${esc(m.reason)}</td><td><button class="btn btn-sm btn-ghost" data-mid="${m.id}">${ICONS.edit}</button></td></tr>`;}).join('')}</tbody><tfoot><tr><td colspan="2">Total days in maintenance</td><td class="num mono">${mt.reduce((s,m)=>s+(m.return_date?Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)):daysSince(m.date_out)),0)}</td><td colspan="2"></td></tr></tfoot></table></div>` : `<div class="empty-row">This ${type.toLowerCase()} has never been sent for maintenance.</div>`);
+    body = `<div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary btn-sm" id="dr-add-maint">${ICONS.plus}Send for maintenance</button></div>` + (mt.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>Sent</th><th>Returned</th><th class="num">Days</th><th>Type</th><th>Reason</th><th>Workshop</th><th class="num">Cost</th><th></th></tr></thead><tbody>${mt.map(m=>{ const d = m.return_date ? Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)) : daysSince(m.date_out); return `<tr><td class="mono">${esc(m.date_out)}</td><td>${m.return_date?`<span class="mono">${esc(m.return_date)}</span>`:'<span class="badge warn"><span class="dot"></span>In maintenance</span>'}</td><td class="num mono">${d}</td><td>${esc(m.maint_type||'')}</td><td class="wrap">${esc(m.reason)}${m.work_done?`<div class="muted" style="font-size:11px">${esc(m.work_done)}</div>`:''}</td><td>${esc(m.workshop||'')}</td><td class="num mono">${money((Number(m.cost_parts)||0)+(Number(m.cost_labour)||0))}</td><td><button class="btn btn-sm btn-ghost" data-mid="${m.id}">${ICONS.edit}</button></td></tr>`;}).join('')}</tbody><tfoot><tr><td colspan="2">Total days in maintenance</td><td class="num mono">${mt.reduce((s,m)=>s+(m.return_date?Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)):daysSince(m.date_out)),0)}</td><td colspan="3">Total maintenance cost</td><td class="num mono">${money(mt.reduce((s,m)=>s+(Number(m.cost_parts)||0)+(Number(m.cost_labour)||0),0))}</td><td></td></tr></tfoot></table></div>` : `<div class="empty-row">This ${type.toLowerCase()} has never been sent for maintenance.</div>`);
   } else {
     const daysY = Math.round((Date.now()-new Date(`${y}-01-01`))/86400000)+1;
     const monthly = [];
@@ -2318,10 +2341,12 @@ function costSummary(from, to, opts){
   const hireTot = { veh:veh.reduce((s,a)=>s+a.cost,0), eq:eq.reduce((s,a)=>s+a.cost,0), idle:veh.concat(eq).reduce((s,a)=>s+a.idle,0) };
   hireTot.total = hireTot.veh+hireTot.eq;
   // expenses
-  const expByCat = PJ ? [] : q('SELECT category, COUNT(*) n, SUM(amount) amount FROM expenses WHERE date>=? AND date<=? GROUP BY category ORDER BY amount DESC',[from,to]);
+  const expByCat = [];
   let expRows = q('SELECT x.*, COALESCE(NULLIF(x.team,""), v.team, e.team, "Unallocated") team2, COALESCE(NULLIF(x.project,""), v.project, e.project, "") project FROM expenses x LEFT JOIN vehicles v ON x.asset_type="Vehicle" AND v.vno=x.asset_ref LEFT JOIN equipment e ON x.asset_type="Equipment" AND e.no=x.asset_ref WHERE x.date>=? AND x.date<=? ORDER BY x.date DESC',[from,to]);
+  const maintRows = q(`SELECT m.id, m.date_out date, 'Maintenance' category, m.asset_type, m.asset_ref, COALESCE(v.team,e.team,'Unallocated') team2, COALESCE(v.project,e.project,'') project, COALESCE(m.cost_parts,0)+COALESCE(m.cost_labour,0) amount, COALESCE(m.maint_type,'')||' — '||COALESCE(m.reason,'') note FROM maintenance m LEFT JOIN vehicles v ON m.asset_type='Vehicle' AND v.vno=m.asset_ref LEFT JOIN equipment e ON m.asset_type='Equipment' AND e.no=m.asset_ref WHERE m.date_out>=? AND m.date_out<=? AND COALESCE(m.cost_parts,0)+COALESCE(m.cost_labour,0)>0`,[from,to]);
+  expRows = expRows.concat(maintRows);
   if(PJ) expRows = expRows.filter(r=>r.project===PJ);
-  if(PJ){ const m={}; expRows.forEach(r=>{ const c=m[r.category]=m[r.category]||{category:r.category,n:0,amount:0}; c.n++; c.amount+=Number(r.amount||0); }); expByCat.push(...Object.values(m).sort((a,b)=>b.amount-a.amount)); }
+  { const m={}; expRows.forEach(r=>{ const c=m[r.category]=m[r.category]||{category:r.category,n:0,amount:0}; c.n++; c.amount+=Number(r.amount||0); }); expByCat.push(...Object.values(m).sort((a,b)=>b.amount-a.amount)); }
   const expTot = expRows.reduce((s,r)=>s+Number(r.amount||0),0);
   const fuelTot = expRows.filter(r=>r.category==='Fuel').reduce((s,r)=>s+Number(r.amount||0),0);
   // purchases
@@ -2625,7 +2650,7 @@ async function exportCostReport(s, label){
     ['Equipment hire', F(`SUMIF(${A('A')},"Equipment",${A('J')})`,s.hireTot.eq)],
     ['   of which idle hire (assets hired but not used — information only)', F(`SUM(${A('M')})`,s.hireTot.idle)],
     ['Fuel', F(`SUMIF(${E('B')},"Fuel",${E('G')})`,s.fuelTot)],
-    ['Other expenses', F(`SUM(${E('G')})-C21`,s.expTot-s.fuelTot)],
+    ['Other expenses (incl. maintenance parts & labour)', F(`SUM(${E('G')})-C21`,s.expTot-s.fuelTot)],
     ['Stock purchases (received)', F(`SUM(${P('C')})`,s.purchTot)],
     ['TOTAL COST', F(`C15+C16+C17+C18+C19+C21+C22+C23`,s.cost)],
     ['NET PROFIT', F(`C14-C24`,s.net)],
@@ -2661,7 +2686,7 @@ async function exportCostReport(s, label){
 let MR = {type:'all'};
 function renderMaintReport(){
   const where = MR.type==='all' ? '' : ` WHERE a.asset_type='${MR.type}'`;
-  const rows = q(`SELECT a.asset_type, a.asset_ref, MAX(a.asset_name) asset_name, COUNT(*) n, MAX(a.date_out) last_out,
+  const rows = q(`SELECT a.asset_type, a.asset_ref, MAX(a.asset_name) asset_name, COUNT(*) n, MAX(a.date_out) last_out, SUM(COALESCE(a.cost_parts,0)+COALESCE(a.cost_labour,0)) cost, MIN(CASE WHEN COALESCE(a.next_due,'')<>'' THEN a.next_due END) next_due,
       SUM(CASE WHEN a.return_date IS NULL OR a.return_date='' THEN 1 ELSE 0 END) open_n,
       SUM(julianday(CASE WHEN a.return_date IS NULL OR a.return_date='' THEN date('now') ELSE a.return_date END) - julianday(a.date_out)) days
       FROM maintenance a${where} GROUP BY a.asset_type, a.asset_ref ORDER BY open_n DESC, n DESC`);
@@ -2677,10 +2702,12 @@ function renderMaintReport(){
       <div class="card"><div class="card-label">Assets with a record</div><div class="card-value">${rows.length}</div><div class="card-foot">${noRec.length} never sent</div></div>
       <div class="card"><div class="card-label">Times sent</div><div class="card-value">${rows.reduce((x,r)=>x+r.n,0)}</div><div class="card-foot">all time</div></div>
       <div class="card"><div class="card-label">Days away</div><div class="card-value">${num(Math.round(rows.reduce((x,r)=>x+Number(r.days||0),0)))}</div><div class="card-foot">total days in maintenance</div></div>
+      ${can('cost')?`<div class="card"><div class="card-label">Maintenance cost</div><div class="card-value">${money(rows.reduce((x,r)=>x+Number(r.cost||0),0))}</div><div class="card-foot">parts + labour, all time</div></div>`:''}
+      <div class="card"><div class="card-label">Service due ≤ 7 days</div><div class="card-value ${rows.filter(r=>r.next_due&&daysUntil(r.next_due)<=7).length?'warn':'good'}">${rows.filter(r=>r.next_due&&daysUntil(r.next_due)<=7).length}</div><div class="card-foot">${rows.filter(r=>r.next_due&&daysUntil(r.next_due)<0).length} overdue</div></div>
     </div>
     <div class="panels-row">
       <div class="panel" style="grid-column:1/-1"><div class="panel-head"><h3>Per vehicle / equipment</h3><span class="tag">click a row for the full history</span></div><div class="panel-body">
-        ${rows.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Type</th><th>Ref</th><th>Asset</th><th class="num">Times sent</th><th>Status</th><th>Last sent</th><th class="num">Total days away</th></tr></thead><tbody>${rows.map(r=>`<tr data-drawer="${esc(r.asset_type)}" data-ref="${esc(r.asset_ref)}" style="cursor:pointer"><td><span class="badge ${r.asset_type==='Vehicle'?'info':'neutral'}"><span class="dot"></span>${esc(r.asset_type)}</span></td><td class="mono">${esc(r.asset_ref)}</td><td>${esc(r.asset_name||'')}</td><td class="num mono">${r.n}</td><td>${r.open_n?'<span class="badge warn"><span class="dot"></span>In maintenance</span>':'<span class="badge good"><span class="dot"></span>Back</span>'}</td><td class="mono">${esc(r.last_out)}</td><td class="num mono">${Math.round(r.days)}</td></tr>`).join('')}</tbody></table></div>`:`<div class="empty-row">Nothing has been sent for maintenance yet.</div>`}
+        ${rows.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Type</th><th>Ref</th><th>Asset</th><th class="num">Times sent</th><th>Status</th><th>Last sent</th><th class="num">Total days away</th><th class="num">Total cost</th><th>Next service</th></tr></thead><tbody>${rows.map(r=>`<tr data-drawer="${esc(r.asset_type)}" data-ref="${esc(r.asset_ref)}" style="cursor:pointer"><td><span class="badge ${r.asset_type==='Vehicle'?'info':'neutral'}"><span class="dot"></span>${esc(r.asset_type)}</span></td><td class="mono">${esc(r.asset_ref)}</td><td>${esc(r.asset_name||'')}</td><td class="num mono">${r.n}</td><td>${r.open_n?'<span class="badge warn"><span class="dot"></span>In maintenance</span>':'<span class="badge good"><span class="dot"></span>Back</span>'}</td><td class="mono">${esc(r.last_out)}</td><td class="num mono">${Math.round(r.days)}</td><td class="num mono">${money(r.cost||0)}</td><td>${r.next_due?`<span class="mono" style="color:${daysUntil(r.next_due)<0?'var(--bad)':daysUntil(r.next_due)<=7?'var(--warn)':'inherit'}">${esc(r.next_due)}</span>`:'<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`:`<div class="empty-row">Nothing has been sent for maintenance yet.</div>`}
       </div></div>
     </div>
     <div class="panels-row">
@@ -2710,7 +2737,7 @@ const XMAP = {
   equipment_moves:{item:'Item', serial:SER, date_out:'Date Out', time_out:'Time Out', department:'Department', assigned:'Assigned Vehicle No', team:'Team', project:'Project', issued_to:'Issued To', return_date:'Return Date', return_time:'Return Time'},
   items:{no:'No', name:'ITEM NAME', start_qty:'Start Quantity', qty_in:'In', qty_out:'Out', current:'Updated Quantity', min_stock:'Minimum Stock', unit_cost:'Unit Cost', unit:'Unit', category:'Category'},
   stock_moves:{date:'Date', type:'Type', item_name:'ITEM NAME', qty:'Qty', location:'Notes2', vehicle_no:'Notes3', remark:'Remark', unit_cost:'Unit Cost'},
-  maintenance:{asset_type:'Asset Type', asset_ref:'Asset Ref', asset_name:'Asset', date_out:'Sent', return_date:'Returned', reason:'Reason'},
+  maintenance:{asset_type:'Asset Type', asset_ref:'Asset Ref', asset_name:'Asset', maint_type:'Type', date_out:'Sent', return_date:'Returned', workshop:'Workshop', meter:'Odometer / Hours', reason:'Reason', work_done:'Work Done', parts:'Parts', cost_parts:'Parts Cost', cost_labour:'Labour Cost', invoice_no:'Invoice No', next_due:'Next Due', next_due_meter:'Next Due Meter', note:'Note'},
   employees:{card_no:'Card No', name:'Name', cpr:'CPR', occupation:'Occupation', team:'Team', project:'Project', timing:'Timing', status:'Status', notes:'Notes'},
   attendance:{date:'Date', card_no:'Card No', name:'Name', occupation:'Occupation', type_day:'Type Day', start_time:'Start Time', normal_hours:'Normal', ot_hours:'Final', extra:'Extra', food:'Food', hours:'Hours', time_in:'In', time_out:'Out', status:'Attendance', remarks:'Remarks'},
   work_log:{date:'Date', work_order:'Work Order No.', requested_by:'Requested By', location:'Location', category:'Work Category', description:'Work Description', team:'Team', status:'Job Status', qty:'Qty', hours:'Duration (Hrs)', amount:'Work Done Amount (BD)', materials:'Site Details / Materials Used', follow_up:'Follow-up Required'},
@@ -2788,7 +2815,7 @@ async function importWorkbook(file){
         if(has('ITEMS')||has('MOVEMENT')){ run('DELETE FROM stock_moves'); run('DELETE FROM items');
           (rowsOf(wb,'ITEMS')||[]).forEach(r=>{ const name=S(r['ITEM NAME']); if(!name) return; run('INSERT OR IGNORE INTO items(no,name,start_qty,qty_in,qty_out,current,min_stock,unit_cost,unit,category) VALUES(?,?,?,0,0,?,?,?,?,?)',[N(r['No']),name,N(r['Start Quantity']),N(r['Start Quantity']),N(r['Minimum Stock']),N(r['Unit Cost']),S(r['Unit']),S(r['Category'])]); });
           (rowsOf(wb,'MOVEMENT')||[]).forEach(r=>{ const name=S(r['ITEM NAME']); if(!name) return; run('INSERT OR IGNORE INTO items(name,start_qty,current) VALUES(?,0,0)',[name]); insertRow('stock_moves',{date:xlDate(r['Date']), type:S(r['Type'])||'Out', item_name:name, qty:N(r['Qty']), location:S(r['Notes2']), vehicle_no:S(r['Notes3']), remark:S(r['Remark']), unit_cost:N(r['Unit Cost'])}); }); }
-        if(has('Maintenance')){ run('DELETE FROM maintenance'); rowsOf(wb,'Maintenance').forEach(r=>{ if(!S(r['Asset Ref'])) return; const t=S(r['Asset Type'])||'Vehicle'; insertRow('maintenance',{asset_type:t, asset_ref:S(r['Asset Ref']), asset_name:S(r['Asset'])||assetName(t,S(r['Asset Ref'])), date_out:xlDate(g(r,'Sent','Date')), return_date:xlDate(g(r,'Returned','Return Date')), reason:S(g(r,'Reason','Description'))}); }); }
+        if(has('Maintenance')){ run('DELETE FROM maintenance'); rowsOf(wb,'Maintenance').forEach(r=>{ if(!S(r['Asset Ref'])) return; const t=S(r['Asset Type'])||'Vehicle'; insertRow('maintenance',{asset_type:t, asset_ref:S(r['Asset Ref']), asset_name:S(r['Asset'])||assetName(t,S(r['Asset Ref'])), date_out:xlDate(g(r,'Sent','Date')), return_date:xlDate(g(r,'Returned','Return Date')), reason:S(g(r,'Reason','Description')), maint_type:S(r['Type'])||'Breakdown repair', workshop:S(r['Workshop']), meter:N(r['Odometer / Hours'])||null, work_done:S(r['Work Done']), parts:S(r['Parts']), cost_parts:N(r['Parts Cost']), cost_labour:N(r['Labour Cost']), invoice_no:S(r['Invoice No']), next_due:xlDate(r['Next Due']), next_due_meter:N(r['Next Due Meter'])||null, note:S(r['Note'])}); }); }
         if(has('Employees')){ run('DELETE FROM employees'); rowsOf(wb,'Employees').forEach(r=> upsertEmployee(r)); }
         if(has('Timesheet')){ run('DELETE FROM attendance'); rowsOf(wb,'Timesheet').forEach(r=> upsertAttendance(r)); }
         if(has('Work Log')){ run('DELETE FROM work_log'); rowsOf(wb,'Work Log').forEach(r=> insertWork(r)); }

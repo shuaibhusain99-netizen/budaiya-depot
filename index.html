@@ -181,7 +181,7 @@ select.sel,input.inp{background:var(--panel-2);border:1px solid var(--border);co
 .td.actions .btn{padding:5px 7px;flex:0 0 auto}
 .td.actions .btn-good[data-act=return]{padding:5px 9px}
 .td .muted{color:var(--dim)}
-.tr .td:has(.badge){overflow:visible}
+.tr .td:has(.badge){overflow:hidden}
 .table-foot{display:flex;justify-content:space-between;align-items:center;padding:9px 14px;font-size:12.5px;color:var(--muted);border-top:1px solid var(--border-soft);background:var(--panel-2)}
 .empty-state{padding:60px 20px;text-align:center;color:var(--dim);display:flex;flex-direction:column;align-items:center;gap:10px;font-size:14px}
 .empty-state .btn{margin-top:4px}
@@ -659,6 +659,7 @@ CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, no INTEGER, name TEXT N
 CREATE TABLE IF NOT EXISTS stock_moves(id INTEGER PRIMARY KEY, date TEXT NOT NULL, type TEXT NOT NULL, item_name TEXT NOT NULL COLLATE NOCASE, qty REAL NOT NULL DEFAULT 0, location TEXT, vehicle_no TEXT, remark TEXT, unit_cost REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS maintenance(id INTEGER PRIMARY KEY, asset_type TEXT NOT NULL, asset_ref TEXT NOT NULL, asset_name TEXT, date_out TEXT NOT NULL, return_date TEXT, reason TEXT);
 CREATE TABLE IF NOT EXISTS departments(id INTEGER PRIMARY KEY, department TEXT NOT NULL, inside TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS teams(id INTEGER PRIMARY KEY, team TEXT NOT NULL, project TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS employees(id INTEGER PRIMARY KEY, card_no TEXT NOT NULL UNIQUE, name TEXT NOT NULL, cpr TEXT, occupation TEXT, team TEXT, timing TEXT, basic_salary REAL DEFAULT 0, status TEXT DEFAULT 'Active', notes TEXT);
 CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY, date TEXT NOT NULL, card_no TEXT NOT NULL, name TEXT, occupation TEXT, type_day TEXT, start_time TEXT, normal_hours REAL DEFAULT 8,
   ot_hours REAL DEFAULT 0, extra REAL DEFAULT 0, food REAL DEFAULT 0, hours REAL DEFAULT 0, time_in TEXT, time_out TEXT, status TEXT DEFAULT 'Working', remarks TEXT, UNIQUE(date, card_no));
@@ -780,6 +781,15 @@ function migrate(){
   run("UPDATE vehicles SET project=CASE WHEN lower(COALESCE(site,'')) LIKE '%isa town%' THEN 'Isa Town Depot' ELSE 'Budaiya Depot' END WHERE project IS NULL OR project=''");
   run("UPDATE equipment SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
   run("UPDATE employees SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
+  if(!qv('SELECT COUNT(*) FROM teams')){
+    const rows = q(`SELECT team, project, COUNT(*) n FROM (
+        SELECT team, project FROM employees WHERE COALESCE(team,'')<>''
+        UNION ALL SELECT team, project FROM vehicles WHERE COALESCE(team,'')<>''
+        UNION ALL SELECT team, project FROM equipment WHERE COALESCE(team,'')<>''
+      ) GROUP BY team, project`);
+    const best = {}; rows.forEach(r=>{ const t=r.team; if(!best[t] || r.n>best[t].n) best[t]={project:r.project||'Budaiya Depot', n:r.n}; });
+    Object.entries(best).forEach(([team,v])=> run('INSERT INTO teams(team,project) VALUES(?,?)',[team, v.project]));
+  }
   run("UPDATE equipment SET rental_basis='month' WHERE rental_basis IS NULL OR rental_basis=''");
   const defaults = {theme:'dark', overdue_days:14, default_min:1, days_per_month:30, hours_per_day:8, ot_multiplier:1.25, holiday_multiplier:1.25, food_rate:1, hire_hours_per_day:12, charge_basic:'attended', site_name:'DEPOT - BUDAIYA', prepared_by:'', projects:'Budaiya Depot\nIsa Town Depot', default_project:'Budaiya Depot', team_aliases:'Sono = Sonoo\nSonu = Sonoo\nHaris = Hares\nAkhlaq = Ikhlaq\nHaytun Nobi = Hayatun Nobi\nNabiur = Nabiur Rahman'};
   Object.entries(defaults).forEach(([k,v])=>{ if(qv('SELECT COUNT(*) FROM settings WHERE key=?',[k])===0) setSettingRaw(k,v); });
@@ -1398,17 +1408,17 @@ const WORK_CATEGORIES = ['Metering Work','Metering Inspection','New Connection W
 const JOB_STATUS = ['Completed','Partially Completed','Postponed','Not Completed - Access','Not Completed - Address','Cancelled','PENDING'];
 const ATT_STATUS = ['Working','Absent','Vacation','Sick Leave','Other Section','Off day'];
 const EXPENSE_CATS = ['Fuel','Materials','Repair (external)','Transport','Permit / fees','Other'];
-function projectNames(){ const set=new Set(String(getSetting('projects','')).split('\n').map(x=>x.trim()).filter(Boolean)); q('SELECT project p FROM vehicles UNION SELECT project FROM equipment UNION SELECT project FROM employees').forEach(r=>{ if(r.p) set.add(r.p); }); return [...set].sort(); }
+function projectNames(){ const set=new Set(String(getSetting('projects','')).split('\n').map(x=>x.trim()).filter(Boolean)); q('SELECT project p FROM vehicles UNION SELECT project FROM equipment UNION SELECT project FROM employees UNION SELECT project FROM teams').forEach(r=>{ if(r.p) set.add(r.p); }); return [...set].sort(); }
 const PROJECT_COL = {key:'project', label:'Project', type:'combo', required:true, optionsFn:()=>projectNames(), default:()=>getSetting('default_project','Budaiya Depot'), w:130, hint:'Which depot / project this belongs to — cost analysis can be filtered per project. Type a new name to create a project.'};
-function teamNames(){ return q('SELECT DISTINCT team FROM employees WHERE team<>"" UNION SELECT DISTINCT team FROM vehicles WHERE team<>"" ORDER BY 1').map(r=>r.team); }
+function teamNames(){ return q('SELECT DISTINCT team FROM teams WHERE team<>"" UNION SELECT DISTINCT team FROM employees WHERE team<>"" UNION SELECT DISTINCT team FROM vehicles WHERE team<>"" UNION SELECT DISTINCT team FROM equipment WHERE team<>"" ORDER BY 1').map(r=>r.team); }
 const ENTITIES = {
   vehicles: { table:'vehicles', label:'Vehicles', singular:'Vehicle', icon:ICONS.truck, group:'Fleet', detail:'Vehicle',
     columns:[
       {key:'vno', label:'Vehicle No.', type:'text', required:true, mono:true, w:110},
       {key:'type', label:'Type', type:'combo', options:['PICKUP','SIXWHEEL','HIAB','TANKER','OTHER'], w:100},
       {key:'model', label:'Model', type:'text', w:200},
-      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), w:130, hint:'Used to allocate hire cost to a team in the cost analysis'},
-      {key:'driver', label:'Default driver', type:'combo', list:{table:'drivers', col:'name'}, w:200, hint:'The table shows the current driver from the open Vehicle log movement when there is one; this is the fallback'},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:130, hint:'Used to allocate hire cost to a team in the cost analysis. Picking a team fills the Project from the Teams register.'},
+      {key:'driver', label:'Default driver', type:'combo', list:{table:'drivers', col:'name'}, w:230, hint:'The table shows the current driver from the open Vehicle log movement when there is one; this is the fallback'},
       {key:'status', label:'Live status', type:'select', options:['GOOD','NEEDS SERVICE','OUT OF SERVICE','standby'], badge:true, w:150, hint:'Auto: shows In maintenance / Out / Available from the logs. This stored value is used only when nothing else applies.'},
       {key:'site', label:'Site / Dept', type:'combo', list:{table:'departments', col:'department'}, w:150},
       PROJECT_COL,
@@ -1442,7 +1452,7 @@ const ENTITIES = {
       {key:'serial', label:'Serial / chassis no.', type:'text', mono:true, w:170},
       {key:'fuel', label:'Fuel', type:'select', options:['Petrol','Diesel','Electric','N/A'], w:90},
       {key:'status', label:'Live status', type:'select', options:['used','standby','Out of service'], badge:true, w:150, hint:'Auto: shows In maintenance / Out / Available from the logs.'},
-      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), w:120, hint:'Optional — allocates hire cost to a team'},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:120, hint:'Allocates hire cost to a team. Picking a team fills the Project from the Teams register.'},
       PROJECT_COL,
       {key:'rental_rate', label:'Hire rate', type:'money', w:100, num:true, section:'Rental (cost analysis)'},
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, w:90, moneyOnly:true},
@@ -1469,14 +1479,15 @@ const ENTITIES = {
     chips:[{id:'', label:'All'},{id:'open', label:'Out now', where:'(return_date IS NULL OR return_date="")'},{id:'ret', label:'Returned', where:'return_date<>""'}]
   },
   items: { table:'items', label:'Stock items', singular:'Item', icon:ICONS.box, group:'Inventory',
+    select:`SELECT items.*, (SELECT COALESCE(SUM(qty),0) FROM stock_moves WHERE item_name=items.name AND lower(type)='in') qty_in, (SELECT COALESCE(SUM(qty),0) FROM stock_moves WHERE item_name=items.name AND lower(type)='out') qty_out FROM items`,
     columns:[
       {key:'no', label:'No.', type:'number', w:60, num:true},
       {key:'name', label:'Item name', type:'text', required:true, w:290},
       {key:'unit', label:'Unit', type:'combo', options:['pcs','bag','box','roll','litre','kg','m','set','pair'], w:70},
       {key:'start_qty', label:'Start', type:'number', w:80, num:true},
-      {key:'qty_in', label:'In', type:'number', w:70, num:true, computed:true},
-      {key:'qty_out', label:'Out', type:'number', w:70, num:true, computed:true},
-      {key:'current', label:'On hand', type:'number', w:90, num:true, computed:true, strong:true},
+      {key:'qty_in', label:'In', type:'number', w:70, num:true, computed:true, inTable:true, hint:'Total received (sum of IN stock movements)'},
+      {key:'qty_out', label:'Out', type:'number', w:70, num:true, computed:true, inTable:true, hint:'Total issued (sum of OUT stock movements)'},
+      {key:'current', label:'On hand', type:'number', w:90, num:true, computed:true, inTable:true, strong:true, hint:'Start + In − Out'},
       {key:'min_stock', label:'Minimum', type:'number', w:90, num:true, section:'Stock control & cost', hint:'A warning appears on the dashboard when "On hand" is at or below this'},
       {key:'unit_cost', label:'Unit cost', type:'money', w:100, num:true, hint:'One-time purchase price per unit — used for purchase cost and stock value'},
       {key:'category', label:'Category', type:'combo', options:['Tools','Consumables','Safety','Materials','Spare parts','Other'], w:120}
@@ -1552,7 +1563,7 @@ const ENTITIES = {
       {key:'name', label:'Name', type:'text', required:true, w:260},
       {key:'cpr', label:'CPR', type:'text', mono:true, w:110},
       {key:'occupation', label:'Occupation', type:'combo', optionsFn:()=>q('SELECT DISTINCT occupation v FROM employees WHERE occupation<>"" ORDER BY 1').map(r=>r.v), w:170},
-      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), w:120},
+      {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:120, hint:'Picking a team fills the Project from the Teams register.'},
       PROJECT_COL,
       {key:'timing', label:'Shift start', type:'time', w:90},
       {key:'basic_salary', label:'Basic salary / month', type:'money', w:140, num:true, computed:true, salary:true, hint:'Encrypted — stored so only the engineer password can read it. Daily = basic ÷ days per month.'},
@@ -1602,6 +1613,14 @@ const ENTITIES = {
     ],
     search:['name','card_no','cpr'], defaultSort:{field:'no', dir:'asc'}
   },
+  teams: { table:'teams', label:'Teams', singular:'Team', icon:ICONS.users, group:'Reference',
+    columns:[
+      {key:'team', label:'Team', type:'text', required:true, w:200},
+      {key:'project', label:'Project / depot', type:'combo', required:true, optionsFn:()=>projectNames(), default:()=>getSetting('default_project','Budaiya Depot'), w:170, hint:'Which project this team works under — vehicles, equipment and staff on this team inherit it for cost analysis'},
+      {key:'note', label:'Note', type:'text', w:240}
+    ],
+    search:['team','project','note'], defaultSort:{field:'project', dir:'asc'}
+  },
   departments: { table:'departments', label:'Departments', singular:'Department entry', icon:ICONS.pin, group:'Reference',
     columns:[
       {key:'department', label:'Department', type:'combo', required:true, optionsFn:()=>deptNames(), w:200},
@@ -1622,7 +1641,7 @@ const NAV_ORDER = [
   {group:'Every day', views:['work_log','attendance','expenses','vehicle_moves','equipment_moves','stock_moves']},
   {group:'Registers', views:['vehicles','equipment','items','maintenance']},
   {group:'Reports', views:['cost','utilisation','maint_report']},
-  {group:'Setup', views:['employees','drivers','departments','data']}
+  {group:'Setup', views:['employees','drivers','teams','departments','data']}
 ];
 function viewMeta(v){ return ENTITIES[v] || SPECIAL_VIEWS[v]; }
 
@@ -1746,7 +1765,7 @@ function renderTable(key){
   const {sql:whereSql, params} = buildWhere(key);
   const total = qv(`SELECT COUNT(*) FROM ${cfg.table}`);
   const count = qv(`SELECT COUNT(*) FROM ${cfg.table}${whereSql}`, params);
-  const cols = cfg.columns.filter(c=> !c.hideInTable && (!c.computed || c.salary) && (can('salary') || !c.salary) && !(c.salary && !can('salary')));
+  const cols = cfg.columns.filter(c=> !c.hideInTable && (!c.computed || c.salary || c.inTable) && (can('salary') || !c.salary) && !(c.salary && !can('salary')));
   const sort = SORT[key]||cfg.defaultSort;
 
   // toolbar: chips + date range
@@ -1787,11 +1806,11 @@ function renderTable(key){
   const PAGE = 100;
   function fetchRows(start, n){
     const pageStart = Math.floor(start/PAGE)*PAGE;
-    if(!cache.has(pageStart)) cache.set(pageStart, q(`SELECT * FROM ${cfg.table}${whereSql}${orderSql(key)} LIMIT ${PAGE} OFFSET ${pageStart}`, params));
+    if(!cache.has(pageStart)) cache.set(pageStart, q(`${cfg.select||('SELECT * FROM '+cfg.table)}${whereSql}${orderSql(key)} LIMIT ${PAGE} OFFSET ${pageStart}`, params));
     let rows = cache.get(pageStart).slice(start-pageStart, start-pageStart+n);
     if(rows.length<n && pageStart+PAGE < count){
       const p2 = pageStart+PAGE;
-      if(!cache.has(p2)) cache.set(p2, q(`SELECT * FROM ${cfg.table}${whereSql}${orderSql(key)} LIMIT ${PAGE} OFFSET ${p2}`, params));
+      if(!cache.has(p2)) cache.set(p2, q(`${cfg.select||('SELECT * FROM '+cfg.table)}${whereSql}${orderSql(key)} LIMIT ${PAGE} OFFSET ${p2}`, params));
       rows = rows.concat(cache.get(p2).slice(0, n-rows.length));
     }
     return rows;
@@ -2934,6 +2953,22 @@ function renderData(){
       <div class="btn-row"><button class="btn btn-primary" id="xl-export">${ICONS.download}Export workbook</button><button class="btn" id="xl-import">${ICONS.sheet}Import workbook</button></div>
       <input type="file" id="xl-file" accept=".xlsx,.xlsm,.xls" style="display:none">
     </div></div>
+    ${can('settings')?`<div class="panel"><div class="panel-head"><h3>Clear old records</h3><span class="tag">engineer only</span></div><div class="panel-body pad">
+      <p>Cost analysis has no stored totals — it adds up the dated records (timesheets, jobs, fuel &amp; expenses, stock movements) for whatever period you pick. To wipe the cost of an old period, delete those records. This removes them for everyone and cannot be undone, but today's automatic server backup is kept, and you can download a copy first below.</p>
+      <div class="btn-row" style="align-items:center;gap:14px;flex-wrap:wrap">
+        <label>Delete records dated <b>before</b> <input type="date" class="inp" id="purge-date" value="${todayStr()}"></label>
+      </div>
+      <div style="margin:10px 0;display:flex;flex-direction:column;gap:6px">
+        <label class="chk"><input type="checkbox" id="pg-att" checked> Timesheets / attendance</label>
+        <label class="chk"><input type="checkbox" id="pg-work" checked> Jobs (work log / BOQ)</label>
+        <label class="chk"><input type="checkbox" id="pg-exp" checked> Fuel &amp; expenses</label>
+        <label class="chk"><input type="checkbox" id="pg-stock" checked> Stock movements</label>
+        <label class="chk"><input type="checkbox" id="pg-moves"> Closed vehicle / equipment / maintenance movements (returned before that date)</label>
+      </div>
+      <div class="btn-row"><button class="btn" id="pg-preview">Preview how many</button><button class="btn btn-danger" id="pg-run">Delete these records</button></div>
+      <div id="pg-out" style="margin-top:10px"></div>
+      <p class="field-note" style="margin-top:8px">Registers (vehicles, equipment, employees, stock item list) are never touched — only dated log rows. This does not affect the online sign-in or the connection settings.</p>
+    </div></div>`:''}
     <div class="panel"><div class="panel-head"><h3>Tables</h3></div><div class="panel-body"><table class="plain"><thead><tr><th>Screen</th><th>SQL table</th><th class="num">Rows</th></tr></thead><tbody>${counts}</tbody></table></div></div>
   </div>`;
   const bk=document.getElementById('db-baks'); if(bk) bk.addEventListener('click', async ()=>{ const box=document.getElementById('db-baks-list'); box.textContent='Loading…'; try{ const rows=await cloudListBackups(); box.innerHTML = rows.length ? `<table class="plain"><thead><tr><th>Day</th><th>Last saved by</th><th class="num">Size</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td class="mono">${esc(r.day)}</td><td>${esc(r.updated_by||'')}</td><td class="num mono">${Math.round((r.size||0)/1024)} KB</td><td><button class="btn btn-ghost" data-bak="${esc(r.day)}">Download</button></td></tr>`).join('')}</tbody></table>` : 'No backups yet.'; box.querySelectorAll('[data-bak]').forEach(b=> b.addEventListener('click', async ()=>{ try{ await cloudDownloadBackup(b.dataset.bak); }catch(e){ toast(e.message,'bad'); } })); }catch(e){ box.textContent=e.message; } });
@@ -2954,6 +2989,21 @@ function renderData(){
   on('sal-0','click', async ()=>{ if(confirm('Set every employee salary to 0?')){ await setAllSalaries(0); toast('All salaries set to 0','good'); render(); } });
   document.getElementById('xl-export').addEventListener('click', exportWorkbook);
   const xf = document.getElementById('xl-file'); document.getElementById('xl-import').addEventListener('click', ()=>xf.click()); xf.addEventListener('change', e=>{ if(e.target.files[0]) importWorkbook(e.target.files[0]); e.target.value=''; });
+  (function(){
+    const dEl=document.getElementById('purge-date'); if(!dEl) return;
+    const specs=()=>{ const d=dEl.value; const list=[]; if(document.getElementById('pg-att').checked) list.push(['Timesheets','attendance','date<?',[d]]); if(document.getElementById('pg-work').checked) list.push(['Jobs','work_log','date<?',[d]]); if(document.getElementById('pg-exp').checked) list.push(['Fuel & expenses','expenses','date<?',[d]]); if(document.getElementById('pg-stock').checked) list.push(['Stock movements','stock_moves','date<?',[d]]);
+      if(document.getElementById('pg-moves').checked){ list.push(['Vehicle movements (closed)','vehicle_moves','return_date IS NOT NULL AND return_date<>"" AND return_date<?',[d]]); list.push(['Equipment movements (closed)','equipment_moves','return_date IS NOT NULL AND return_date<>"" AND return_date<?',[d]]); list.push(['Maintenance (closed)','maintenance','return_date IS NOT NULL AND return_date<>"" AND return_date<?',[d]]); }
+      return {d, list}; };
+    const counts=()=>{ const {d,list}=specs(); return {d, rows:list.map(([label,tbl,where,p])=>({label,tbl,where,p,n:qv(`SELECT COUNT(*) FROM ${tbl} WHERE ${where}`,p)}))}; };
+    document.getElementById('pg-preview').addEventListener('click', ()=>{ const {d,rows}=counts(); const tot=rows.reduce((s,r)=>s+r.n,0); document.getElementById('pg-out').innerHTML = !d ? '<span class="badge bad">Pick a date first</span>' : `<table class="plain"><tbody>${rows.map(r=>`<tr><td>${esc(r.label)}</td><td class="num mono">${num(r.n)}</td></tr>`).join('')}<tr><td><b>Total to delete</b></td><td class="num mono"><b>${num(tot)}</b></td></tr></tbody></table>`; });
+    document.getElementById('pg-run').addEventListener('click', async ()=>{ const {d,rows}=counts(); const tot=rows.reduce((s,r)=>s+r.n,0);
+      if(!d){ toast('Pick a date first','bad'); return; }
+      if(!rows.length){ toast('Tick at least one type of record','bad'); return; }
+      if(!tot){ toast('Nothing dated before '+d,'warn'); return; }
+      if(!confirm(`Permanently delete ${tot} record(s) dated before ${d}?\n\n`+rows.filter(r=>r.n).map(r=>`• ${r.n} ${r.label}`).join('\n')+`\n\nToday's server backup is kept. This cannot be undone.`)) return;
+      try{ await mutate(()=>{ rows.forEach(r=>{ if(r.n) run(`DELETE FROM ${r.tbl} WHERE ${r.where}`, r.p); }); }); toast(`Deleted ${tot} record(s) before ${d}`,'good'); renderData(); }
+      catch(e){ toast('Could not delete: '+e.message,'bad'); } });
+  })();
 }
 
 /* ===================================================================== utilisation (movement analysis) */

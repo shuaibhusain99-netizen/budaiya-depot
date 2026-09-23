@@ -637,7 +637,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
      again so the screen never shows a stale copy.
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -660,6 +660,8 @@ CREATE TABLE IF NOT EXISTS stock_moves(id INTEGER PRIMARY KEY, date TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS maintenance(id INTEGER PRIMARY KEY, asset_type TEXT NOT NULL, asset_ref TEXT NOT NULL, asset_name TEXT, date_out TEXT NOT NULL, return_date TEXT, reason TEXT);
 CREATE TABLE IF NOT EXISTS departments(id INTEGER PRIMARY KEY, department TEXT NOT NULL, inside TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS teams(id INTEGER PRIMARY KEY, team TEXT NOT NULL, project TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS asset_rates(id INTEGER PRIMARY KEY, asset_type TEXT NOT NULL, asset_ref TEXT NOT NULL, rate REAL NOT NULL DEFAULT 0, basis TEXT NOT NULL DEFAULT 'hour', effective_from TEXT NOT NULL, set_by TEXT, set_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_asset_rates ON asset_rates(asset_type, asset_ref, effective_from);
 CREATE TABLE IF NOT EXISTS employees(id INTEGER PRIMARY KEY, card_no TEXT NOT NULL UNIQUE, name TEXT NOT NULL, cpr TEXT, occupation TEXT, team TEXT, timing TEXT, basic_salary REAL DEFAULT 0, status TEXT DEFAULT 'Active', notes TEXT);
 CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY, date TEXT NOT NULL, card_no TEXT NOT NULL, name TEXT, occupation TEXT, type_day TEXT, start_time TEXT, normal_hours REAL DEFAULT 8,
   ot_hours REAL DEFAULT 0, extra REAL DEFAULT 0, food REAL DEFAULT 0, hours REAL DEFAULT 0, time_in TEXT, time_out TEXT, status TEXT DEFAULT 'Working', remarks TEXT, UNIQUE(date, card_no));
@@ -795,6 +797,12 @@ function migrate(){
   run("UPDATE vehicle_moves SET project=(SELECT t.project FROM teams t WHERE t.team=vehicle_moves.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''");
   run("UPDATE equipment_moves SET project=(SELECT t.project FROM teams t WHERE t.team=equipment_moves.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''");
   run("UPDATE expenses SET project=(SELECT t.project FROM teams t WHERE t.team=expenses.team) WHERE (project IS NULL OR project='') AND COALESCE(team,'')<>''");
+  // hire-rate history: every asset starts with the rate it has today, valid for all past dates;
+  // from now on a change to the rate applies from the day it is made (see syncRateHistory)
+  if(!qv('SELECT COUNT(*) FROM asset_rates')){
+    q("SELECT vno ref, rental_rate rate, COALESCE(NULLIF(rental_basis,''),'month') basis FROM vehicles WHERE COALESCE(rental_rate,0)>0 AND COALESCE(vno,'')<>''").forEach(a=> run("INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by) VALUES('Vehicle',?,?,?,'2000-01-01','initial rate')",[a.ref,a.rate,a.basis]));
+    q("SELECT no ref, rental_rate rate, COALESCE(NULLIF(rental_basis,''),'month') basis FROM equipment WHERE COALESCE(rental_rate,0)>0 AND COALESCE(no,'')<>''").forEach(a=> run("INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by) VALUES('Equipment',?,?,?,'2000-01-01','initial rate')",[a.ref,a.rate,a.basis]));
+  }
   if(!qv('SELECT COUNT(*) FROM teams')){
     const rows = q(`SELECT team, project, COUNT(*) n FROM (
         SELECT team, project FROM employees WHERE COALESCE(team,'')<>''
@@ -953,8 +961,23 @@ async function mutate(fn){
   await SAVE_QUEUE;
   await refreshFromFile();
   const out = tx(fn);
-  await saveToFile(fn);
+  try{ tx(syncRateHistory); }catch(e){ console.warn('rate history sync', e); }
+  await saveToFile(()=>{ const r=fn(); syncRateHistory(); return r; });
   return out;
+}
+/* A hire-rate change is recorded with today's date, so every day before today keeps the rate that was in force. */
+function syncRateHistory(){
+  if(!DB) return;
+  const today = todayStr(), who = CURRENT_USER ? CURRENT_USER.display : '', now = new Date().toISOString();
+  [['Vehicle','vehicles','vno'],['Equipment','equipment','no']].forEach(([type,tbl,col])=>{
+    q(`SELECT ${col} ref, COALESCE(rental_rate,0) rate, COALESCE(NULLIF(rental_basis,''),'month') basis FROM ${tbl} WHERE COALESCE(${col},'')<>''`).forEach(a=>{
+      const last = q1('SELECT id, rate, basis, effective_from FROM asset_rates WHERE asset_type=? AND asset_ref=? ORDER BY effective_from DESC, id DESC LIMIT 1',[type, a.ref]);
+      if(!last && !Number(a.rate)) return;
+      if(last && Math.abs(Number(last.rate)-Number(a.rate))<1e-9 && last.basis===a.basis) return;
+      if(last && last.effective_from>=today) run('UPDATE asset_rates SET rate=?, basis=?, effective_from=?, set_by=?, set_at=? WHERE id=?',[Number(a.rate), a.basis, today, who, now, last.id]);
+      else run('INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by,set_at) VALUES(?,?,?,?,?,?,?)',[type, a.ref, Number(a.rate), a.basis, today, who, now]);
+    });
+  });
 }
 setInterval(async ()=>{ if(DB && !document.hidden && await refreshFromFile()){ render(); toast('Database updated by another user — screen refreshed','warn'); } }, 15000);
 window.addEventListener('focus', async ()=>{ if(DB && await refreshFromFile()) render(); });
@@ -1203,7 +1226,9 @@ function normalizeTeam(name){
   const hit = known.find(t=>t.toLowerCase()===n.toLowerCase()); return hit || n;
 }
 /* one spelling per team, employees' spelling wins, then case-insensitive merge */
-function makeCanon(){ const c={}; q('SELECT DISTINCT team FROM employees WHERE team<>""').forEach(r=>{ c[r.team.trim().toLowerCase()]=c[r.team.trim().toLowerCase()]||r.team.trim(); }); return t=>{ const k=String(t||'').trim().toLowerCase(); if(!k) return ''; if(!c[k]) c[k]=String(t).trim(); return c[k]; }; }
+function makeCanon(){ const al=teamAliasMap(), c={}; const alias=t=>{ let n=String(t||'').trim(); for(let i=0;i<3 && al[n.toLowerCase()];i++) n=al[n.toLowerCase()]; return n; };
+  q('SELECT DISTINCT team FROM employees WHERE team<>""').forEach(r=>{ const n=alias(r.team), k=n.toLowerCase(); c[k]=c[k]||n; });
+  return t=>{ const n=alias(t), k=n.toLowerCase(); if(!k) return ''; if(!c[k]) c[k]=n; return c[k]; }; }
 
 function styleHeader(row, from, to, fill){ for(let c=from;c<=to;c++){ const cell=row.getCell(c); cell.fill={type:'pattern',pattern:'solid',fgColor:{argb:fill||RPT.head}}; cell.font={bold:true,color:{argb:RPT.white},size:10}; cell.alignment={vertical:'middle',horizontal:'center',wrapText:true}; cell.border=thin(); } }
 function thin(){ const s={style:'thin',color:{argb:'FFBFC7D1'}}; return {top:s,left:s,bottom:s,right:s}; }
@@ -1229,8 +1254,12 @@ async function buildDailyCostReport(date){
   const vehs = q('SELECT * FROM vehicles WHERE COALESCE(count_cost,1)=1 ORDER BY vno').filter(a=>!PJ || (a.project||'')===PJ).map(a=>({...a, team:canon(a.team)}));
   const eqs = q('SELECT * FROM equipment WHERE COALESCE(count_cost,1)=1 ORDER BY no').filter(a=>!PJ || (a.project||'')===PJ).map(a=>({...a, team:canon(a.team)}));
   const assets = [];
-  eqs.forEach(a=>{ const k='Equipment|'+a.no; assets.push({cls:assetClassOf('Equipment',a), desc:a.item, no:a.serial||a.no, team:a.team||'', avail: !inMaint.has(k) && !/out of service/i.test(a.status||''), rateHr: rentalDailyRate(a)/hrsAvail, used: assetUsedDays('Equipment',a,date,date)>0, fuel: fuel[k]||0}); });
-  vehs.forEach(a=>{ const k='Vehicle|'+a.vno; assets.push({cls:'Vehicle', desc:a.model||a.type||'', no:a.vno, team:a.team||'', avail: !inMaint.has(k) && !/out of service/i.test(a.status||''), rateHr: rentalDailyRate(a)/hrsAvail, used: assetUsedDays('Vehicle',a,date,date)>0, fuel: fuel[k]||0}); });
+  const hctx = hireContext(date, date);
+  const hireRow = (type, a, extra)=>{ const h = assetHireDay(hctx, type, a, date); const k=type+'|'+(type==='Vehicle'?a.vno:a.no);
+    return Object.assign({team: canon(h.team||a.team||''), avail: h.hours>0 && h.rate>0, hours: h.hours, src: h.src,
+      rateHr: h.hours>0 ? (h.basis==='hour' ? h.rate : h.cost/h.hours) : (h.basis==='hour' ? h.rate : 0), used: h.used, fuel: fuel[k]||0}, extra); };
+  eqs.forEach(a=> assets.push(hireRow('Equipment', a, {cls:assetClassOf('Equipment',a), desc:a.item, no:a.serial||a.no})));
+  vehs.forEach(a=> assets.push(hireRow('Vehicle', a, {cls:'Vehicle', desc:a.model||a.type||'', no:a.vno})));
   assets.sort((x,y)=> (x.cls==='Machinery'?0:x.cls==='Vehicle'?1:2)-(y.cls==='Machinery'?0:y.cls==='Vehicle'?1:2));
   const teams = [...new Set(emps.map(e=>e.team).concat(work.map(w=>w.team)).concat(assets.map(a=>a.team)).filter(Boolean))].sort();
 
@@ -1272,12 +1301,12 @@ async function buildDailyCostReport(date){
   /* ---------- Assets ---------- */
   const wsA = wb.addWorksheet('Assets', {views:[{state:'frozen', ySplit:4}]});
   wsA.getCell('B2').value='ASSET REGISTER'; wsA.getCell('B2').font={bold:true,size:14};
-  wsA.getRow(4).values=['S/N','Asset Class','Section ','Asset / Description','Vehicle No.','Assigned To Team','Available Today','Hire Rate (BD/Hr)','Hours Available','Hire Charged (BD)','Used Today','Hours Used','Utilisation %','Idle Hire Cost (BD)','Fuel (BD)','Total Charge (BD)']; styleHeader(wsA.getRow(4),1,16); wsA.getRow(4).height=32;
+  wsA.getRow(4).values=['S/N','Asset Class','Section ','Asset / Description','Vehicle No.','Assigned To Team','Available Today','Hire Rate (BD/Hr)','Duty Hours','Hire Charged (BD)','Used Today','Hours Used','Utilisation %','Idle Hire Cost (BD)','Fuel (BD)','Total Charge (BD)']; styleHeader(wsA.getRow(4),1,16); wsA.getRow(4).height=32;
   [5,18,18,40.9,17.7,17,13,14,13,14,11,12,12,15,11,14].forEach((w,i)=>wsA.getColumn(i+1).width=w);
   const aFirst=5, aLast=aFirst+Math.max(assets.length,1)-1, aTot=aLast+1;
   let hireTot=0, idleTot=0, fuelTot=0;
-  assets.forEach((a,i)=>{ const rn=aFirst+i; const charged = a.avail? a.rateHr*hrsAvail : 0; const hrsUsed = a.used? hrsAvail:0; const util = charged? hrsUsed/hrsAvail : 0; const idle = charged*(1-util); hireTot+=charged; idleTot+=idle; fuelTot+=a.fuel;
-    const r=wsA.getRow(rn); r.values=[F('ROW()-4',i+1), a.cls, site.replace('DEPOT - ','')+' Depot', a.desc, a.no, a.team, a.avail?'Yes':'No', a.rateHr, hrsAvail, F(`IF($G${rn}="Yes",$H${rn}*I${rn},0)`,charged), a.used?'Yes':'No', hrsUsed, F(`IF($J${rn}=0,0,IFERROR($L${rn}/$I${rn},0))`,util), F(`$J${rn}*(1-$M${rn})`,idle), a.fuel||0, F(`$J${rn}+$O${rn}`,charged+a.fuel)];
+  assets.forEach((a,i)=>{ const rn=aFirst+i; const charged = a.avail? a.rateHr*a.hours : 0; const hrsUsed = (a.avail && a.used)? a.hours:0; const util = charged && a.hours? hrsUsed/a.hours : 0; const idle = charged*(1-util); hireTot+=charged; idleTot+=idle; fuelTot+=a.fuel;
+    const r=wsA.getRow(rn); r.values=[F('ROW()-4',i+1), a.cls, site.replace('DEPOT - ','')+' Depot', a.desc, a.no, a.team, a.avail?'Yes':'No', a.rateHr, a.hours, F(`IF($G${rn}="Yes",$H${rn}*I${rn},0)`,charged), a.used?'Yes':'No', hrsUsed, F(`IF($J${rn}=0,0,IFERROR($L${rn}/$I${rn},0))`,util), F(`$J${rn}*(1-$M${rn})`,idle), a.fuel||0, F(`$J${rn}+$O${rn}`,charged+a.fuel)];
     [8,10,14,15,16].forEach(c=>r.getCell(c).numFmt=RPT.money); [9,12].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(13).numFmt=RPT.pct; zebra(r,1,16,i); });
   const at=wsA.getRow(aTot); at.getCell(4).value='TOTAL'; at.getCell(10).value=F(`SUM(J${aFirst}:J${aLast})`,hireTot); at.getCell(12).value=F(`SUM(L${aFirst}:L${aLast})`,0); at.getCell(13).value=F(`IFERROR(SUMIFS(L${aFirst}:L${aLast},G${aFirst}:G${aLast},"Yes")/SUMIFS(I${aFirst}:I${aLast},G${aFirst}:G${aLast},"Yes"),0)`,0); at.getCell(14).value=F(`SUM(N${aFirst}:N${aLast})`,idleTot); at.getCell(15).value=F(`SUM(O${aFirst}:O${aLast})`,fuelTot); at.getCell(16).value=F(`SUM(P${aFirst}:P${aLast})`,hireTot+fuelTot); [10,14,15,16].forEach(c=>at.getCell(c).numFmt=RPT.money); at.getCell(13).numFmt=RPT.pct; totalRow(at,1,16);
 
@@ -1328,11 +1357,11 @@ async function buildDailyCostReport(date){
   band(ws,'B24:I24','TEAM PERFORMANCE');
   ws.getRow(25).values=['','Team','Jobs','Work Done (BD)','Manpower Cost (BD)','Asset Cost (BD)','Total Cost (BD)','Net (BD)','Margin %']; styleHeader(ws.getRow(25),2,9);
   let rn=26; const tFirst=rn;
-  const teamStats = t=>{ const jobs=work.filter(w=>w.team===t); const wd=jobs.reduce((s,w)=>s+Number(w.amount||0),0); const mp=emps.filter(e=>e.team===t).reduce((s,e)=>{ const a=att[e.card_no]; if(!a||a.status!=='Working') return s; const d=salaryOf(e.card_no)/dpm; const dm=(a.type_day&&a.type_day!=='Normal')?hmult:mult; return s+d+d/hpd*dm*Number(a.ot_hours||0)+Number(a.food||0)*foodRate; },0); const as=assets.filter(a=>a.team===t).reduce((s,a)=>s+(a.avail?a.rateHr*hrsAvail:0)+a.fuel,0); return {jobs:jobs.length, wd, mp, as}; };
+  const teamStats = t=>{ const jobs=work.filter(w=>w.team===t); const wd=jobs.reduce((s,w)=>s+Number(w.amount||0),0); const mp=emps.filter(e=>e.team===t).reduce((s,e)=>{ const a=att[e.card_no]; if(!a||a.status!=='Working') return s; const d=salaryOf(e.card_no)/dpm; const dm=(a.type_day&&a.type_day!=='Normal')?hmult:mult; return s+d+d/hpd*dm*Number(a.ot_hours||0)+Number(a.food||0)*foodRate; },0); const as=assets.filter(a=>a.team===t).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0); return {jobs:jobs.length, wd, mp, as}; };
   teams.forEach((t,i)=>{ const r=ws.getRow(rn); const s=teamStats(t);
     r.values=['',t, F(`COUNTIFS('Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.jobs), F(`SUMIFS('Work-1'!$X$${wFirst}:$X$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.wd), F(`SUMIFS(Manpower!$M$${mFirst}:$M$${mLast},Manpower!$F$${mFirst}:$F$${mLast},$B${rn})`,s.mp), F(`SUMIFS(Assets!$P$${aFirst}:$P$${aLast},Assets!$F$${aFirst}:$F$${aLast},$B${rn})`,s.as), F(`E${rn}+F${rn}`,s.mp+s.as), F(`D${rn}-G${rn}`,s.wd-s.mp-s.as), F(`IFERROR(H${rn}/D${rn},"")`, s.wd?(s.wd-s.mp-s.as)/s.wd:'')];
     r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,i); rn++; });
-  { const r=ws.getRow(rn); const ua=assets.filter(a=>!a.team).reduce((s,a)=>s+(a.avail?a.rateHr*hrsAvail:0)+a.fuel,0); r.values=['','Unallocated asset hire',0,0,0, F(`SUMPRODUCT((Assets!$F$${aFirst}:$F$${aLast}="")*Assets!$P$${aFirst}:$P$${aLast})`,ua), F(`E${rn}+F${rn}`,ua), F(`D${rn}-G${rn}`,-ua), F(`IFERROR(H${rn}/D${rn},"")`,'')]; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,1); rn++; }
+  { const r=ws.getRow(rn); const ua=assets.filter(a=>!a.team).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0); r.values=['','Unallocated asset hire',0,0,0, F(`SUMPRODUCT((Assets!$F$${aFirst}:$F$${aLast}="")*Assets!$P$${aFirst}:$P$${aLast})`,ua), F(`E${rn}+F${rn}`,ua), F(`D${rn}-G${rn}`,-ua), F(`IFERROR(H${rn}/D${rn},"")`,'')]; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,1); rn++; }
   const tLastListed=rn-1;
   { const r=ws.getRow(rn); const listedTeams=teams; const oj=work.filter(w=>!listedTeams.includes(w.team)).length, ow=work.filter(w=>!listedTeams.includes(w.team)).reduce((s,w)=>s+Number(w.amount||0),0);
     r.values=['','Other / team not listed above', F(`COUNTA('Work-1'!$G$${wFirst}:$G$${wLast})-SUM(C${tFirst}:C${tLastListed})`,oj), F(`'Work-1'!$X$${wTot}-SUM(D${tFirst}:D${tLastListed})`,ow), F(`Manpower!$M$${mTot}-SUM(E${tFirst}:E${tLastListed})`,0), F(`Assets!$P$${aTot}-SUM(F${tFirst}:F${tLastListed})`,0), F(`E${rn}+F${rn}`,0), F(`D${rn}-G${rn}`,ow), F(`IFERROR(H${rn}/D${rn},"")`,'')]; r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,0); rn++; }
@@ -1341,10 +1370,10 @@ async function buildDailyCostReport(date){
   band(ws,`B${rn}:I${rn}`,'ASSET HIRE & UTILISATION'); rn++;
   ws.getRow(rn).values=['','Asset Class','Assigned','Used','Hire Charged (BD)','Hrs Available','Hrs Used','Utilisation %','Idle Hire (BD)']; styleHeader(ws.getRow(rn),2,9); rn++;
   const acFirst=rn;
-  ['Machinery','Vehicle','Safety Equipment'].forEach((cls,i)=>{ const r=ws.getRow(rn); const rows=assets.filter(a=>a.cls===cls); const av=rows.filter(a=>a.avail); const used=av.filter(a=>a.used); const charged=av.reduce((s,a)=>s+a.rateHr*hrsAvail,0); const hA=av.length*hrsAvail, hU=used.length*hrsAvail; const idle=av.reduce((s,a)=>s+a.rateHr*hrsAvail*(a.used?0:1),0);
+  ['Machinery','Vehicle','Safety Equipment'].forEach((cls,i)=>{ const r=ws.getRow(rn); const rows=assets.filter(a=>a.cls===cls); const av=rows.filter(a=>a.avail); const used=av.filter(a=>a.used); const charged=av.reduce((s,a)=>s+a.rateHr*a.hours,0); const hA=av.reduce((s,a)=>s+a.hours,0), hU=used.reduce((s,a)=>s+a.hours,0); const idle=av.reduce((s,a)=>s+a.rateHr*a.hours*(a.used?0:1),0);
     r.values=['',cls, F(`COUNTIFS(Assets!$B$${aFirst}:$B$${aLast},$B${rn},Assets!$G$${aFirst}:$G$${aLast},"Yes")`,av.length), F(`COUNTIFS(Assets!$B$${aFirst}:$B$${aLast},$B${rn},Assets!$G$${aFirst}:$G$${aLast},"Yes",Assets!$K$${aFirst}:$K$${aLast},"Yes")`,used.length), F(`SUMIFS(Assets!$J$${aFirst}:$J$${aLast},Assets!$B$${aFirst}:$B$${aLast},$B${rn})`,charged), F(`SUMIFS(Assets!$I$${aFirst}:$I$${aLast},Assets!$B$${aFirst}:$B$${aLast},$B${rn},Assets!$G$${aFirst}:$G$${aLast},"Yes")`,hA), F(`SUMIFS(Assets!$L$${aFirst}:$L$${aLast},Assets!$B$${aFirst}:$B$${aLast},$B${rn},Assets!$G$${aFirst}:$G$${aLast},"Yes")`,hU), F(`IFERROR(G${rn}/F${rn},0)`,hA?hU/hA:0), F(`SUMIFS(Assets!$N$${aFirst}:$N$${aLast},Assets!$B$${aFirst}:$B$${aLast},$B${rn})`,idle)];
     [3,4].forEach(c=>r.getCell(c).numFmt=RPT.int); r.getCell(5).numFmt=RPT.money; [6,7].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(8).numFmt=RPT.pct; r.getCell(9).numFmt=RPT.money; zebra(r,2,9,i); rn++; });
-  { const r=ws.getRow(rn); r.values=['','TOTAL', F(`SUM(C${acFirst}:C${rn-1})`,assets.filter(a=>a.avail).length), F(`SUM(D${acFirst}:D${rn-1})`,assets.filter(a=>a.avail&&a.used).length), F(`SUM(E${acFirst}:E${rn-1})`,hireTot), F(`SUM(F${acFirst}:F${rn-1})`,assets.filter(a=>a.avail).length*hrsAvail), F(`SUM(G${acFirst}:G${rn-1})`,assets.filter(a=>a.avail&&a.used).length*hrsAvail), F(`IFERROR(G${rn}/F${rn},0)`,0), F(`SUM(I${acFirst}:I${rn-1})`,idleTot)]; [3,4].forEach(c=>r.getCell(c).numFmt=RPT.int); r.getCell(5).numFmt=RPT.money; [6,7].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(8).numFmt=RPT.pct; r.getCell(9).numFmt=RPT.money; totalRow(r,2,9); rn+=3; }
+  { const r=ws.getRow(rn); r.values=['','TOTAL', F(`SUM(C${acFirst}:C${rn-1})`,assets.filter(a=>a.avail).length), F(`SUM(D${acFirst}:D${rn-1})`,assets.filter(a=>a.avail&&a.used).length), F(`SUM(E${acFirst}:E${rn-1})`,hireTot), F(`SUM(F${acFirst}:F${rn-1})`,assets.filter(a=>a.avail).reduce((x,a)=>x+a.hours,0)), F(`SUM(G${acFirst}:G${rn-1})`,assets.filter(a=>a.avail&&a.used).reduce((x,a)=>x+a.hours,0)), F(`IFERROR(G${rn}/F${rn},0)`,0), F(`SUM(I${acFirst}:I${rn-1})`,idleTot)]; [3,4].forEach(c=>r.getCell(c).numFmt=RPT.int); r.getCell(5).numFmt=RPT.money; [6,7].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(8).numFmt=RPT.pct; r.getCell(9).numFmt=RPT.money; totalRow(r,2,9); rn+=3; }
 
   band(ws,`B${rn}:E${rn}`,'JOB STATUS'); band(ws,`G${rn}:J${rn}`,'FOLLOW-UP REQUIRED'); rn++;
   ws.getRow(rn).values=['','Status','Jobs','Amount (BD)','% of Jobs','','Item','','','Count']; styleHeader(ws.getRow(rn),2,5); styleHeader(ws.getRow(rn),7,10); ws.mergeCells(`G${rn}:I${rn}`); rn++;
@@ -1355,8 +1384,36 @@ async function buildDailyCostReport(date){
   { const r=ws.getRow(rn); r.values=['','TOTAL', F(`SUM(C${jsFirst}:C${rn-1})`,work.length), F(`SUM(D${jsFirst}:D${rn-1})`,workDone), F(`IFERROR(C${rn}/C${rn},0)`,work.length?1:0)]; r.getCell(3).numFmt=RPT.int; r.getCell(4).numFmt=RPT.money; r.getCell(5).numFmt=RPT.pct; totalRow(r,2,5); }
   ws.pageSetup={orientation:'portrait', fitToPage:true, fitToWidth:1, fitToHeight:0, margins:{left:0.4,right:0.4,top:0.5,bottom:0.5,header:0.2,footer:0.2}};
 
+  applyReportTheme(wb, ws);
   const buf = await wb.xlsx.writeBuffer();
   return {buf, summary:{workDone, totalCost, net, margin, jobs:work.length, staffOnSite, manpowerTot, hireTot, fuelTot, teams:teams.length}};
+}
+/* Reference look: Tahoma throughout, dark-blue titles, grey mini-labels, bordered info & KPI boxes, green profit, red idle/negative. */
+function applyReportTheme(wb, ws){
+  const INK='FF262626', BLUE='FF1F3864', GREEN='FF1F6F3D', RED='FFC00000', GREY='FF7F7F7F', LINK='FF0000CC';
+  const fontOf=(cell, o)=>{ const f=Object.assign({}, cell.font||{}); if(!f.name) f.name='Tahoma'; if(!f.size) f.size=10; if(!f.color) f.color={argb:INK}; cell.font=Object.assign(f, o||{}); };
+  wb.eachSheet(sh=>{
+    sh.eachRow({includeEmpty:false}, row=>{ row.eachCell({includeEmpty:false}, c=>{ fontOf(c); }); });
+    const t=sh.getCell('B2'); if(t.value && sh!==ws){ fontOf(t,{size:18,bold:true,color:{argb:BLUE}}); sh.getRow(2).height=27.75; }
+    // sheet header row 4 (detail sheets): keep white bold on blue, but Tahoma
+    if(sh!==ws){ const r4=sh.getRow(4); r4.eachCell({includeEmpty:false}, c=>{ if(c.fill && c.fill.fgColor && c.fill.fgColor.argb===RPT.head) fontOf(c,{bold:true,color:{argb:'FFFFFFFF'}}); }); }
+  });
+  /* ---- Daily Report ---- */
+  fontOf(ws.getCell('B2'),{size:20,bold:true,color:{argb:BLUE}}); ws.getCell('B2').alignment={vertical:'middle'}; ws.getRow(2).height=27.75;
+  const box=(ref)=>{ const [a,b]=ref.split(':'); const r=ws.getCell(a).row, c1=ws.getCell(a).col, c2=ws.getCell(b).col; for(let c=c1;c<=c2;c++){ const cell=ws.getCell(r,c); cell.border={top:{style:'thin',color:{argb:'FFBFBFBF'}},bottom:{style:'thin',color:{argb:'FFBFBFBF'}},left:c===c1?{style:'thin',color:{argb:'FFBFBFBF'}}:undefined,right:c===c2?{style:'thin',color:{argb:'FFBFBFBF'}}:undefined}; } };
+  ['B4:C4','D4:E4','F4:G4','H4:I4','J4:K4'].forEach(ref=>{ box(ref); fontOf(ws.getCell(ref.split(':')[0]),{size:8,bold:true,color:{argb:GREY}}); ws.getCell(ref.split(':')[0]).alignment={vertical:'middle'}; });
+  ['B5:C5','D5:E5','F5:G5','H5:I5','J5:K5'].forEach(ref=>{ box(ref); const c=ws.getCell(ref.split(':')[0]); fontOf(c,{size:10,bold:true,color:{argb:BLUE}}); c.alignment={vertical:'middle',horizontal:'left'}; });
+  fontOf(ws.getCell('D5'),{bold:false,color:{argb:LINK}}); fontOf(ws.getCell('F5'),{bold:false,color:{argb:INK}});
+  ws.getRow(4).height=15; ws.getRow(5).height=15;
+  ['B7:C7','D7:E7','F7:G7','H7:I7','J7:K7'].forEach(ref=>{ box(ref); const c=ws.getCell(ref.split(':')[0]); fontOf(c,{size:8,bold:true,color:{argb:GREY}}); c.alignment={vertical:'middle'}; });
+  ['B8:C8','D8:E8','F8:G8','H8:I8','J8:K8'].forEach(ref=>{ box(ref); const c=ws.getCell(ref.split(':')[0]); fontOf(c,{size:20,bold:true,color:{argb:BLUE}}); c.alignment={vertical:'middle',horizontal:'left'}; });
+  fontOf(ws.getCell('F8'),{color:{argb:GREEN}});
+  ws.getRow(7).height=15; ws.getRow(8).height=28;
+  // cost breakdown: net profit green, margin green, idle red
+  fontOf(ws.getCell('I18'),{bold:true,color:{argb:GREEN}}); fontOf(ws.getCell('H18'),{bold:true}); fontOf(ws.getCell('I19'),{bold:true,color:{argb:GREEN}}); fontOf(ws.getCell('I20'),{bold:true,color:{argb:RED}});
+  ws.getRow(13).height=19.5;
+  // negative net / margin in red wherever a money or % cell is negative
+  ws.eachRow({includeEmpty:false}, row=>{ row.eachCell({includeEmpty:false}, c=>{ const v=(c.value&&c.value.result!==undefined)?c.value.result:c.value; if(typeof v==='number' && v<0 && /#,##0|%/.test(c.numFmt||'')) fontOf(c,{color:{argb:RED}}); }); });
 }
 async function downloadDailyCostReport(date){
   toast('Building the report…','warn');
@@ -1461,7 +1518,7 @@ function assetName(type, ref){
    Each entity maps to one SQL table. Columns drive the table view, the form,
    the search and the Excel round-trip. */
 
-const RATE_BASIS = ['month','day','hour'];
+const RATE_BASIS = ['hour','day','month'];
 const WORK_CATEGORIES = ['Metering Work','Metering Inspection','New Connection Work','New Connection Inspection','Emergency Maintenance Work','Valve Maintenance','Leak Detection Works','Depot Work','Other'];
 const JOB_STATUS = ['Completed','Partially Completed','Postponed','Not Completed - Access','Not Completed - Address','Cancelled','PENDING'];
 const ATT_STATUS = ['Working','Absent','Vacation','Sick Leave','Other Section','Off day'];
@@ -1481,8 +1538,8 @@ const ENTITIES = {
       {key:'status', label:'Live status', type:'select', options:['GOOD','NEEDS SERVICE','OUT OF SERVICE','standby'], badge:true, w:150, hint:'Auto: shows In maintenance / Out / Available from the logs. This stored value is used only when nothing else applies.'},
       {key:'site', label:'Site / Dept', type:'combo', list:{table:'departments', col:'department'}, w:150},
       PROJECT_COL,
-      {key:'rental_rate', label:'Hire rate', type:'money', w:100, num:true, section:'Rental (cost analysis)'},
-      {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, w:90, moneyOnly:true},
+      {key:'rental_rate', label:'Hire rate (BD)', type:'money', w:100, num:true, section:'Rental (cost analysis)', hint:'Changing the rate applies from today onward — earlier days keep the rate that was in force (see History → Hire rate history)'},
+      {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, default:()=>'hour', w:90, moneyOnly:true, hint:'hour = charged for the duty hours of the driver / team that day'},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this vehicle from cost analysis and utilisation'},
       {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
@@ -1515,8 +1572,8 @@ const ENTITIES = {
       {key:'status', label:'Live status', type:'select', options:['used','standby','Out of service'], badge:true, w:150, hint:'Auto: shows In maintenance / Out / Available from the logs.'},
       {key:'team', label:'Team', type:'combo', optionsFn:()=>teamNames(), linkTo:{target:'project', table:'teams', match:'team', value:'project'}, w:120, hint:'Allocates hire cost to a team. Picking a team fills the Project from the Teams register.'},
       PROJECT_COL,
-      {key:'rental_rate', label:'Hire rate', type:'money', w:100, num:true, section:'Rental (cost analysis)'},
-      {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, w:90, moneyOnly:true},
+      {key:'rental_rate', label:'Hire rate (BD)', type:'money', w:100, num:true, section:'Rental (cost analysis)', hint:'Changing the rate applies from today onward — earlier days keep the rate that was in force (see History → Hire rate history)'},
+      {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, default:()=>'hour', w:90, moneyOnly:true, hint:'hour = charged for the duty hours of the driver / team that day'},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this equipment from cost analysis and utilisation'},
       {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
@@ -2235,6 +2292,7 @@ function openAssetDrawer(type, ref, tab){
     body = `<div class="kv">
       <div><small>Hire rate</small>${Number(a.rental_rate)?`<span class="mono" style="font-weight:600">${money(a.rental_rate)}</span> ${CURRENCY} / ${esc(a.rental_basis||'month')}`:'<span class="muted">Not set — edit the record</span>'}</div>
       <div><small>Rate is per</small>${esc(a.rental_basis||'month')}</div>
+      <div style="grid-column:1/-1"><small>Hire rate history</small>${(()=>{ const rh=q('SELECT rate, basis, effective_from, set_by FROM asset_rates WHERE asset_type=? AND asset_ref=? ORDER BY effective_from DESC, id DESC',[type, ref]); return rh.length ? `<table class="plain" style="margin-top:4px"><thead><tr><th>From</th><th class="num">Rate</th><th>Per</th><th>Set by</th></tr></thead><tbody>${rh.map(r=>`<tr><td class="mono">${r.effective_from==='2000-01-01'?'(start)':esc(r.effective_from)}</td><td class="num mono">${money(r.rate)}</td><td>${esc(r.basis)}</td><td>${esc(r.set_by||'')}</td></tr>`).join('')}</tbody></table>` : '<span class="muted">No rate recorded</span>'; })()}</div>
       <div><small>Counted in cost</small>${Number(a.count_cost)!==0?'<span class="badge good"><span class="dot"></span>Yes</span>':'<span class="badge neutral"><span class="dot"></span>No — excluded</span>'}</div>
       <div><small>Counted in utilisation</small>${Number(a.count_util)!==0?'<span class="badge good"><span class="dot"></span>Yes</span>':'<span class="badge neutral"><span class="dot"></span>No — excluded</span>'}</div>
       <div><small>Hire cost this year</small><span class="mono" style="font-weight:600">${money(rentYear)}</span> ${CURRENCY}</div>
@@ -2325,11 +2383,11 @@ function rentalDailyRate(a){
   const b = a.rental_basis||'month', hh = numSetting('hire_hours_per_day',12);
   if(b==='day') return r;
   if(b==='hour') return r * hh;
-  return r / numSetting('days_per_month',30) / numSetting('hours_per_day',8) * hh;
+  return r / numSetting('days_per_month',30);
 }
 function maintDays(type, ref, from, to){ return q('SELECT date_out, return_date FROM maintenance WHERE asset_type=? AND asset_ref=? AND date_out<=? AND (return_date IS NULL OR return_date="" OR return_date>=?)',[type,ref,to,from]).reduce((s,m)=>s+overlapDays(m.date_out, m.return_date||'', from, to),0); }
 function rentalDaysFor(a, from, to){ return overlapDays(a.rental_start||'0000-01-01', a.rental_end||'', from, to); }
-function rentalCostFor(a, from, to){ return rentalDaysFor(a, from, to) * rentalDailyRate(a); }
+function rentalCostFor(a, from, to){ if(!a) return 0; const ctx=hireContext(from,to); const days=[...activeDaysInPeriod(from,to)].sort(); return assetHireRange(ctx, typeOfAsset(a), a, days).cost; }
 function assetUsedDays(type, a, from, to){
   const ref = type==='Vehicle' ? a.vno : a.no;
   const logged = qv('SELECT COUNT(*) FROM daily_usage WHERE asset_type=? AND asset_ref=? AND date>=? AND date<=?',[type,ref,from,to]);
@@ -2354,6 +2412,80 @@ function activeDaysInPeriod(from, to){
   add(q('SELECT DISTINCT date d FROM stock_moves WHERE date>=? AND date<=?',[from,to]));
   return s;
 }
+/* ===================================================================== HOURLY HIRE ENGINE
+   Cost of an asset on a day = rate in force that day × duty hours that day.
+   - Rate in force: latest entry in asset_rates with effective_from ≤ the day.
+   - Duty hours: whoever had the asset that day —
+       1. the vehicle's driver (driver on the open movement, else the default driver) if the timesheet shows him working;
+       2. otherwise its team (team on the open movement, else the asset's team): the longest duty hours among team members who worked;
+          if the team is on the timesheet but nobody worked, the asset is not charged;
+       3. otherwise the default hire hours per day (Import & settings).
+   - "day" / "month" rates (older records) are charged per day hired: rate, or rate ÷ days-per-month.
+   - Nothing is charged while the asset is in maintenance or out of service. */
+function rateHistoryMap(){ const m={}; q('SELECT asset_type, asset_ref, rate, basis, effective_from FROM asset_rates ORDER BY effective_from, id').forEach(r=>{ const k=r.asset_type+'|'+r.asset_ref; (m[k]=m[k]||[]).push(r); }); return m; }
+function rateFrom(list, date, a){
+  if(!list || !list.length) return {rate:Number(a.rental_rate)||0, basis:a.rental_basis||'hour'};
+  let cur=null; for(const r of list){ if(r.effective_from<=date) cur=r; else break; }
+  return cur ? {rate:Number(cur.rate)||0, basis:cur.basis||'hour'} : {rate:0, basis:list[0].basis||'hour'};
+}
+function hireContext(from, to){
+  const canon = makeCanon(), att = {};
+  q(`SELECT a.date, UPPER(TRIM(COALESCE(e.name,a.name,''))) nm, COALESCE(e.team,'') team, a.status, COALESCE(a.hours,0) h, COALESCE(a.normal_hours,0)+COALESCE(a.ot_hours,0) h2
+     FROM attendance a LEFT JOIN employees e ON e.card_no=a.card_no WHERE a.date>=? AND a.date<=?`,[from,to]).forEach(r=>{
+    const d = att[r.date] = att[r.date] || {name:{}, team:{}};
+    const working = r.status==='Working', h = working ? (Number(r.h)||Number(r.h2)||0) : 0;
+    if(r.nm) d.name[r.nm] = {h, working};
+    const t = canon(r.team).toLowerCase();
+    if(t){ const x = d.team[t] = d.team[t] || {max:0, n:0, w:0}; x.n++; if(working){ x.w++; x.max = Math.max(x.max, h); } }
+  });
+  const vm = q(`SELECT vno, driver, team, project, date_out, return_date FROM vehicle_moves WHERE date_out<=? AND (return_date IS NULL OR return_date='' OR return_date>=?) ORDER BY date_out, id`,[to,from]);
+  const em = q(`SELECT item, serial, team, project, date_out, return_date FROM equipment_moves WHERE date_out<=? AND (return_date IS NULL OR return_date='' OR return_date>=?) ORDER BY date_out, id`,[to,from]);
+  const mt = q(`SELECT asset_type, asset_ref, date_out, return_date FROM maintenance WHERE date_out<=? AND (return_date IS NULL OR return_date='' OR return_date>=?)`,[to,from]);
+  const du = {}, duAny = new Set();
+  q('SELECT asset_type, asset_ref, date, status FROM daily_usage WHERE date>=? AND date<=?',[from,to]).forEach(r=>{ const k=r.asset_type+'|'+r.asset_ref; du[k+'|'+r.date]=r.status; duAny.add(k); });
+  return {canon, att, vm, em, mt, du, duAny, rates:rateHistoryMap(), def:numSetting('hire_hours_per_day',12), dpm:numSetting('days_per_month',30), memo:{}};
+}
+function assetHireDay(ctx, type, a, d){
+  const ref = type==='Vehicle' ? a.vno : a.no, k = type+'|'+ref;
+  let mem = ctx.memo[k];
+  if(!mem){ mem = ctx.memo[k] = {
+      moves: type==='Vehicle' ? ctx.vm.filter(m=>m.vno===a.vno) : ctx.em.filter(m=>m.item===a.item && (!a.serial || m.serial===a.serial)),
+      maint: ctx.mt.filter(m=>m.asset_type===type && m.asset_ref===ref) }; }
+  let mv = null; for(const m of mem.moves){ if(m.date_out<=d && (!m.return_date || m.return_date>=d)) mv = m; }
+  const team = ctx.canon((mv && mv.team) || a.team || '');
+  const project = (mv && mv.project) || a.project || '';
+  const driver = type==='Vehicle' ? String((mv && mv.driver) || a.driver || '').trim().toUpperCase() : '';
+  const {rate, basis} = rateFrom(ctx.rates[k], d, a);
+  const out = {date:d, type, ref, team:team||'', project, driver, rate, basis, hours:0, cost:0, used:false, src:''};
+  if(/out of service/i.test(a.status||'')){ out.src='out of service'; return out; }
+  if(mem.maint.some(m=>overlapDays(m.date_out, m.return_date||'', d, d)>0)){ out.src='maintenance'; return out; }
+  if(rentalDaysFor(a,d,d)<=0){ out.src='not on hire'; return out; }
+  const day = ctx.att[d], drv = day && driver ? day.name[driver] : null, tm = day && team ? day.team[team.toLowerCase()] : null;
+  if(drv && drv.working && drv.h>0){ out.hours = drv.h; out.src = 'driver'; }
+  else if(tm && tm.n){ out.hours = tm.max; out.src = tm.w ? 'team' : 'team off'; }
+  else { out.hours = ctx.def; out.src = 'default'; }
+  // Hire is always charged by the hour: an hourly rate as-is; a daily rate is the price of one standard duty day
+  // (Hire hours per day setting) and is prorated by the actual duty hours; a monthly rate = month / days per month / duty hours.
+  const hourly = basis==='hour' ? rate : basis==='day' ? rate/(ctx.def||12) : rate/ctx.dpm/(ctx.def||12);
+  out.rateHr = hourly;
+  if(out.hours>0 && rate>0) out.cost = hourly*out.hours;
+  // Used today: an explicit daily-usage log wins; otherwise a movement record, or — for an asset assigned to a
+  // team / driver — the fact that the team or driver was on duty that day (its hours are their duty hours).
+  out.used = ctx.duAny.has(k) ? ctx.du[k+'|'+d]==='Used' : (!!mv || out.src==='driver' || out.src==='team');
+  return out;
+}
+/* Hire for one asset over a set of days (only days with a cost are kept). */
+function assetHireRange(ctx, type, a, days, project){
+  const rows = days.map(d=>assetHireDay(ctx,type,a,d)).filter(x=>x.cost>0 && (!project || x.project===project));
+  const cost = rows.reduce((s,x)=>s+x.cost,0), hours = rows.reduce((s,x)=>s+x.hours,0), usedHours = rows.reduce((s,x)=>s+(x.used?x.hours:0),0);
+  const byTeam = {}; rows.forEach(x=>{ byTeam[x.team]=(byTeam[x.team]||0)+x.hours; });
+  const team = Object.keys(byTeam).sort((p,q2)=>byTeam[q2]-byTeam[p])[0] || ctx.canon(a.team||'');
+  const k = type+'|'+(type==='Vehicle'?a.vno:a.no); const now = rateFrom(ctx.rates[k], days.length?days[days.length-1]:todayStr(), a);
+  const util = hours ? usedHours/hours : 0;
+  return {rows, cost, hours, usedHours, days:rows.length, used:rows.filter(x=>x.used).length, util, idle: cost*(1-util), team, rate_now:now.rate, basis_now:now.basis};
+}
+function typeOfAsset(a){ return a && a.vno!==undefined ? 'Vehicle' : 'Equipment'; }
+
 let COST_PROJECT = '';   // '' = all projects
 function costSummary(from, to, opts){
   opts = opts||{}; const PJ = opts.project||'';
@@ -2375,12 +2507,11 @@ function costSummary(from, to, opts){
   // asset hire — only on active depot days
   const active = activeDaysInPeriod(from, to);
   const activeArr = [...active].sort();
-  const mkAsset = (type, a)=>{ const oos=/out of service/i.test(a.status||''); const ref=type==='Vehicle'?a.vno:a.no;
-    let days = 0;
-    if(!oos){ activeArr.forEach(d=>{ if(rentalDaysFor(a,d,d)>0 && maintDays(type,ref,d,d)===0) days++; }); }
-    const cost=days*rentalDailyRate(a); const used=opts.skipUtil?0:Math.min(days, assetUsedDays(type,a,from,to)); return {...a, type, ref, label:type==='Vehicle'?`${a.vno} · ${a.model||''}`:`${a.no} · ${a.item}`, team:canon(a.team)||'Unallocated', days, used, util: days?used/days:0, cost, idle: days? cost*(1-used/days):0}; };
-  const veh = q('SELECT * FROM vehicles WHERE rental_rate>0 AND COALESCE(count_cost,1)=1 AND (?=\'\' OR COALESCE(project,\'\')=?)',[PJ,PJ]).map(a=>mkAsset('Vehicle',a)).filter(a=>a.days>0);
-  const eq = q('SELECT * FROM equipment WHERE rental_rate>0 AND COALESCE(count_cost,1)=1 AND (?=\'\' OR COALESCE(project,\'\')=?)',[PJ,PJ]).map(a=>mkAsset('Equipment',a)).filter(a=>a.days>0);
+  const hctx = hireContext(from, to);
+  const mkAsset = (type, a)=>{ const ref=type==='Vehicle'?a.vno:a.no; const h = assetHireRange(hctx, type, a, activeArr, PJ);
+    return {...a, type, ref, label:type==='Vehicle'?`${a.vno} · ${a.model||''}`:`${a.no} · ${a.item}`, team:h.team||'Unallocated', project:(h.rows[0]&&h.rows[0].project)||a.project||'', days:h.days, used:h.used, hours:h.hours, usedHours:h.usedHours, util:h.util, cost:h.cost, idle:h.idle, daily:h.rows, rate_now:h.rate_now, basis_now:h.basis_now}; };
+  const veh = q('SELECT * FROM vehicles WHERE COALESCE(count_cost,1)=1 ORDER BY vno').map(a=>mkAsset('Vehicle',a)).filter(a=>a.cost>0);
+  const eq = q('SELECT * FROM equipment WHERE COALESCE(count_cost,1)=1 ORDER BY no').map(a=>mkAsset('Equipment',a)).filter(a=>a.cost>0);
   const hireTot = { veh:veh.reduce((s,a)=>s+a.cost,0), eq:eq.reduce((s,a)=>s+a.cost,0), idle:veh.concat(eq).reduce((s,a)=>s+a.idle,0) };
   hireTot.total = hireTot.veh+hireTot.eq;
   // expenses
@@ -2403,7 +2534,7 @@ function costSummary(from, to, opts){
   const teams = {};
   const T = n=> teams[n] = teams[n] || {team:n, jobs:0, work:0, labor:0, hire:0, exp:0, staff:0};
   labor.forEach(r=>{ const t=T(r.team); t.labor+=r.total; if(r.days_worked>0) t.staff++; });
-  veh.concat(eq).forEach(a=>{ T(canon(a.team)||'Unallocated').hire+=a.cost; });
+  veh.concat(eq).forEach(a=> a.daily.forEach(x=>{ T(canon(x.team)||'Unallocated').hire+=x.cost; }));
   expRows.forEach(r=>{ T(canon(r.team2)||'Unallocated').exp+=Number(r.amount||0); });
   workByTeam.forEach(r=>{ const t=T(canon(r.team)||'Unassigned'); t.jobs+=r.jobs; t.work+=Number(r.amount||0); });
   Object.values(teams).forEach(t=>{ t.cost=t.labor+t.hire+t.exp; t.net=t.work-t.cost; t.margin=t.work?t.net/t.work:null; });
@@ -2573,7 +2704,7 @@ function renderCost(){
   const trend = trendSeries(COST_MODE==='custom'?'daily':COST_MODE, COST_MODE==='daily'?COST_ANCHOR.daily:COST_MODE==='monthly'?COST_ANCHOR.monthly:COST_MODE==='annual'?COST_ANCHOR.annual:to);
   const trendTitle = COST_MODE==='annual' ? 'By month' : COST_MODE==='monthly' ? 'By day' : 'Last 14 days';
   const kpi = (l,v,foot,tone,go,chip)=>`<div class="card" ${go?`data-go="${go}" data-chip="${chip||''}"`:''}><div class="card-label">${l}</div><div class="card-value ${tone||''}">${v}</div><div class="card-foot">${foot}</div></div>`;
-  const hireTable = (rows, isV)=> rows.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>${isV?'Vehicle':'Equipment'}</th><th>Team</th><th>Project</th><th class="num">Rate</th><th class="num">Days hired</th><th class="num">Days used</th><th class="num">Utilisation</th><th class="num">Hire (BD)</th><th class="num">Idle hire (BD)</th></tr></thead><tbody>${rows.map(a=>`<tr data-drawer="${a.type}" data-ref="${esc(a.ref)}" style="cursor:pointer"><td>${esc(a.label)}</td><td>${esc(a.team)}</td><td>${esc(a.project||'')}</td><td class="num mono">${money(a.rental_rate)} / ${esc(a.rental_basis)}</td><td class="num mono">${a.days}</td><td class="num mono">${a.used}</td><td class="num mono" style="color:${a.util<0.3?'var(--bad)':a.util<0.6?'var(--warn)':'var(--good)'}">${Math.round(a.util*100)}%</td><td class="num mono">${money(a.cost)}</td><td class="num mono">${money(a.idle)}</td></tr>`).join('')}</tbody><tfoot><tr><td colspan="7">Total</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.cost,0))}</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.idle,0))}</td></tr></tfoot></table></div>` : `<div class="empty-row">No rented ${isV?'vehicles':'equipment'} with a hire rate in this period.</div>`;
+  const hireTable = (rows, isV)=> rows.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>${isV?'Vehicle':'Equipment'}</th><th>Team</th><th>Project</th><th class="num">Rate now</th><th class="num">Days</th><th class="num">Duty hours</th><th class="num">Hours used</th><th class="num">Utilisation</th><th class="num">Hire (BD)</th><th class="num">Idle hire (BD)</th></tr></thead><tbody>${rows.map(a=>`<tr data-drawer="${a.type}" data-ref="${esc(a.ref)}" style="cursor:pointer"><td>${esc(a.label)}</td><td>${esc(a.team)}</td><td>${esc(a.project||'')}</td><td class="num mono">${money(a.rate_now)} / ${esc(a.basis_now)}</td><td class="num mono">${a.days}</td><td class="num mono">${(a.hours||0).toFixed(1)}</td><td class="num mono">${(a.usedHours||0).toFixed(1)}</td><td class="num mono" style="color:${a.util<0.3?'var(--bad)':a.util<0.6?'var(--warn)':'var(--good)'}">${Math.round(a.util*100)}%</td><td class="num mono">${money(a.cost)}</td><td class="num mono">${money(a.idle)}</td></tr>`).join('')}</tbody><tfoot><tr><td colspan="8">Total</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.cost,0))}</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.idle,0))}</td></tr></tfoot></table></div>` : `<div class="empty-row">No rented ${isV?'vehicles':'equipment'} with a hire rate in this period.</div>`;
   document.getElementById('content').innerHTML = `
     <div class="toolbar"><div class="chips">${modes.map(m=>`<button class="chip ${COST_MODE===m[0]?'on':''}" data-mode="${m[0]}">${m[1]}</button>`).join('')}</div><span class="sp"></span>${nav}</div>
     <div class="toolbar"><span class="muted" style="font-size:12px;margin-right:6px">Project</span><div class="chips"><button class="chip ${COST_PROJECT===''?'on':''}" data-project="">All projects</button>${projects.map(p=>`<button class="chip ${COST_PROJECT===p?'on':''}" data-project="${esc(p)}">${esc(p)}</button>`).join('')}</div><span class="sp"></span>${COST_MODE==='daily'&&can('salary')?`<button class="btn btn-primary" id="cost-daily-rpt">${ICONS.sheet}Daily Cost Report (Excel)</button>`:''}<button class="btn" id="cost-export">${ICONS.download}Cost analysis workbook (Excel, live formulas)</button></div>
@@ -2618,110 +2749,181 @@ function renderCost(){
 async function exportCostReport(s, label){
   toast('Building the workbook…','warn');
   try{
-  const wb = new ExcelJS.Workbook(); wb.creator='Budaiya Depot Control';
+  const wb = new ExcelJS.Workbook(); wb.creator='Budaiya Depot Control'; wb.calcProperties = {fullCalcOnLoad:true};
   const dpm=numSetting('days_per_month',30), hpd=numSetting('hours_per_day',8), mult=numSetting('ot_multiplier',1.25), hmult=numSetting('holiday_multiplier',mult), food=numSetting('food_rate',1), hh=numSetting('hire_hours_per_day',12);
   const canon = makeCanon();
-  const proj = COST_PROJECT || 'All projects';
-  const head = (ws, row, n)=>{ styleHeader(ws.getRow(row),1,n); ws.getRow(row).height=30; };
-  const fmt = (ws, cols, f, from, to)=>{ cols.forEach(c=>{ for(let r=from;r<=to;r++) ws.getCell(r,c).numFmt=f; }); };
-  const rng = (col, from, to)=>`${col}${from}:${col}${Math.max(to,from)}`;
+  const site = getSetting('site_name','DEPOT - BUDAIYA'), proj = COST_PROJECT || 'All projects';
+  const preparedBy = getSetting('prepared_by','') || (CURRENT_USER?CURRENT_USER.display:'');
+  /* ---- style kit (same look as the Daily Work & Cost Report) ---- */
+  const K = {band:'FF1F3864', head:'FF2F5597', zebra:'FFF4F7FB', total:'FFD6DCE4', line:'FFC8D0DE', title:'FF1F3864', muted:'FF5B6B82', white:'FFFFFFFF', input:'FFFFF2CC', good:'FF1E7B4F', bad:'FFB42318'};
+  const fill = c=>({type:'pattern',pattern:'solid',fgColor:{argb:c}});
+  const edge = ()=>{ const e={style:'thin',color:{argb:K.line}}; return {top:e,left:e,bottom:e,right:e}; };
+  const font = (cell,o)=>{ cell.font = Object.assign({name:'Tahoma', size:10}, o||{}); };
+  const xd = d=>{ if(!d||!/^\d{4}-\d{2}-\d{2}$/.test(d)) return d||''; const [y,m,dd]=d.split('-').map(Number); return new Date(Date.UTC(y,m-1,dd)); };
+  const sheet = (name, titleText, sub, widths, frozenCols)=>{ const ws = wb.addWorksheet(name, {views:[{state:'frozen', ySplit:4, xSplit:frozenCols||0, showGridLines:false}], properties:{defaultRowHeight:15}});
+    widths.forEach((w,i)=> ws.getColumn(i+1).width=w);
+    ws.getCell('B2').value=titleText; font(ws.getCell('B2'),{bold:true,size:16,color:{argb:K.title}}); ws.getRow(2).height=24;
+    ws.getCell('B3').value=sub; font(ws.getCell('B3'),{size:9,italic:true,color:{argb:K.muted}}); return ws; };
+  const header = (ws,row,from,labels)=>{ labels.forEach((t,i)=>{ const c=ws.getCell(row,from+i); c.value=t; c.fill=fill(K.head); font(c,{bold:true,color:{argb:K.white}}); c.alignment={vertical:'middle',horizontal:'center',wrapText:true}; c.border=edge(); }); ws.getRow(row).height=32; };
+  const bodyRow = (ws,row,from,to,i)=>{ for(let c=from;c<=to;c++){ const cell=ws.getCell(row,c); cell.border=edge(); if(!cell.font||cell.font.name!=='Tahoma') font(cell, cell.font&&cell.font.bold?{bold:true}:undefined); if(i%2) cell.fill=fill(K.zebra); } };
+  const totalsRow = (ws,row,from,to)=>{ for(let c=from;c<=to;c++){ const cell=ws.getCell(row,c); cell.fill=fill(K.total); font(cell,{bold:true}); cell.border=edge(); } ws.getRow(row).height=18; };
+  const band = (ws,row,from,to,text)=>{ ws.mergeCells(row,from,row,to); const c=ws.getCell(row,from); c.value='  '+text; c.fill=fill(K.band); font(c,{bold:true,size:11,color:{argb:K.white}}); c.alignment={vertical:'middle'}; ws.getRow(row).height=20; };
+  const nf = (ws,cols,f,from,to)=> cols.forEach(c=>{ for(let r=from;r<=to;r++) ws.getCell(r,c).numFmt=f; });
+  const R = (sh,col,a,b)=>`${sh}!$${col}$${a}:$${col}$${Math.max(a,b)}`;
+  const period = s.from===s.to ? s.from : `${s.from} to ${s.to}`;
+  const subLine = `${site} · ${label} (${period}) · ${proj}`;
 
-  const ws = wb.addWorksheet('Report', {views:[{showGridLines:false}]});   // created first so it is the first tab; filled at the end
-  /* ---------- Manpower ---------- */
-  const wsM = wb.addWorksheet('Manpower', {views:[{state:'frozen', ySplit:1}]});
-  wsM.getRow(1).values=['S/N','Card No.','Name','Team','Project','Occupation','Days worked','Days logged','Hours','Basic salary / month','Daily salary','Basic cost','OT hours','OT hours (weighted)','OT rate / hr','OT cost','Food allowances','Food cost','Total cost']; head(wsM,1,19);
-  [6,10,28,14,16,18,9,9,8,13,11,11,9,11,10,11,9,10,12].forEach((w,i)=>wsM.getColumn(i+1).width=w);
-  const mF=2, mL=mF+Math.max(s.labor.length,1)-1;
-  s.labor.forEach((r,i)=>{ const n=mF+i; wsM.getRow(n).values=[i+1,r.card_no,r.name,r.team,r.project||'',r.occupation||'',r.days_worked,r.days_logged,r.hours,r.basic,
-    F(`J${n}/Report!$C$6`,r.daily), F(`G${n}*K${n}`,r.basic_cost), r.ot_hours, r.ot_hours_w, F(`K${n}/Report!$C$7*Report!$C$8`,r.ot_rate), F(`N${n}*K${n}/Report!$C$7`,r.ot_cost), r.food_n, F(`Q${n}*Report!$C$10`,r.food_cost), F(`L${n}+P${n}+R${n}`,r.total)]; });
-  { const n=mL+1, r=wsM.getRow(n); r.values=['','TOTAL','','','','',F(`SUM(${rng('G',mF,mL)})`,s.labor.reduce((a,b)=>a+b.days_worked,0)),'',F(`SUM(${rng('I',mF,mL)})`,s.labor.reduce((a,b)=>a+Number(b.hours||0),0)),'','',F(`SUM(${rng('L',mF,mL)})`,s.laborTot.basic),F(`SUM(${rng('M',mF,mL)})`,s.laborTot.ot_hours),'','',F(`SUM(${rng('P',mF,mL)})`,s.laborTot.ot),'',F(`SUM(${rng('R',mF,mL)})`,s.laborTot.food),F(`SUM(${rng('S',mF,mL)})`,s.laborTot.total)]; totalRow(r,1,19); }
-  fmt(wsM,[10,11,12,15,16,18,19],RPT.money,mF,mL+1); fmt(wsM,[9,13,14],RPT.hrs,mF,mL+1);
-  wsM.getCell(mL+3,1).value='OT hours (weighted) = OT hours × OT multiplier for normal days, × holiday multiplier for Friday / holiday rows (see Report!C8:C9).'; wsM.getCell(mL+3,1).font={italic:true,color:{argb:'FF666666'}};
+  const ws = wb.addWorksheet('Report', {views:[{showGridLines:false}]});   // first tab; filled at the end
 
-  /* ---------- Assets ---------- */
-  const wsA = wb.addWorksheet('Assets', {views:[{state:'frozen', ySplit:1}]});
-  wsA.getRow(1).values=['Asset type','Ref','Description','Team','Project','Rate','Rate is per','Daily rate','Days hired','Hire cost','Days used','Utilisation','Idle hire']; head(wsA,1,13);
-  [11,11,32,14,16,10,9,11,9,12,9,10,12].forEach((w,i)=>wsA.getColumn(i+1).width=w);
-  const assets=s.veh.concat(s.eq), aF=2, aL=aF+Math.max(assets.length,1)-1;
-  assets.forEach((a,i)=>{ const n=aF+i; wsA.getRow(n).values=[a.type,a.ref,a.label,a.team,a.project||'',Number(a.rental_rate)||0,a.rental_basis||'month',
-    F(`IF(G${n}="day",F${n},IF(G${n}="hour",F${n}*Report!$C$11,F${n}/Report!$C$6/Report!$C$7*Report!$C$11))`,rentalDailyRate(a)), a.days, F(`I${n}*H${n}`,a.cost), a.used, F(`IFERROR(K${n}/I${n},0)`,a.util), F(`J${n}*(1-L${n})`,a.idle)]; });
-  { const n=aL+1, r=wsA.getRow(n); r.values=['TOTAL','','','','','','','',F(`SUM(${rng('I',aF,aL)})`,assets.reduce((x,a)=>x+a.days,0)),F(`SUM(${rng('J',aF,aL)})`,s.hireTot.total),F(`SUM(${rng('K',aF,aL)})`,assets.reduce((x,a)=>x+a.used,0)),F(`IFERROR(K${n}/I${n},0)`,assets.reduce((x,a)=>x+a.days,0)?assets.reduce((x,a)=>x+a.used,0)/assets.reduce((x,a)=>x+a.days,0):0),F(`SUM(${rng('M',aF,aL)})`,s.hireTot.idle)]; totalRow(r,1,13); }
-  fmt(wsA,[6,8,10,13],RPT.money,aF,aL+1); fmt(wsA,[12],RPT.pct,aF,aL+1);
+  /* ---------- Assumptions ---------- */
+  const wsS = sheet('Assumptions','ASSUMPTIONS','Yellow cells are inputs — change one and every sheet recalculates.',[2,40,14,70]);
+  header(wsS,4,2,['Setting','Value','Used for']);
+  const A = [['Days per month',dpm,'Daily salary = monthly salary ÷ days per month; month-rate hire = rate ÷ days per month'],
+             ['Hours per day (normal)',hpd,'Overtime hourly rate = daily salary ÷ hours per day'],
+             ['OT multiplier — normal day',mult,'Overtime on a normal day'],
+             ['OT multiplier — Friday / holiday',hmult,'Overtime on Friday / public holiday rows of the timesheet'],
+             ['Food allowance rate (BD)',food,'Food cost = allowances × rate'],
+             ['Default hire hours per day',hh,'Hours charged for an asset when neither its driver nor its team is on the timesheet (applied when the Asset Hire log is built)']];
+  A.forEach((a,i)=>{ const r=5+i; wsS.getCell(r,2).value=a[0]; wsS.getCell(r,3).value=a[1]; wsS.getCell(r,4).value=a[2]; bodyRow(wsS,r,2,4,0); wsS.getCell(r,3).fill=fill(K.input); wsS.getCell(r,4).alignment={wrapText:true}; font(wsS.getCell(r,4),{size:9,color:{argb:K.muted}}); });
+  const DPM='Assumptions!$C$5', HPD='Assumptions!$C$6', OTM='Assumptions!$C$7', OTH='Assumptions!$C$8', FOOD='Assumptions!$C$9';
 
   /* ---------- Work ---------- */
   const work = q('SELECT date, work_order, requested_by, location, category, description, team, status, qty, hours, amount, materials, follow_up FROM work_log WHERE date>=? AND date<=? ORDER BY date, id',[s.from,s.to]).map(w=>({...w, team:canon(w.team)||'Unassigned'}));
-  const wsW = wb.addWorksheet('Work', {views:[{state:'frozen', ySplit:1}]});
-  wsW.getRow(1).values=['Date','Work Order No.','Requested By','Location','Work Category','Work Description','Team','Job Status','Qty','Duration (Hrs)','Work Done Amount (BD)','Site Details / Materials Used','Follow-up Required']; head(wsW,1,13);
-  [11,14,14,18,22,36,12,12,6,8,14,30,10].forEach((w,i)=>wsW.getColumn(i+1).width=w);
-  const wF=2, wL=wF+Math.max(work.length,1)-1;
-  work.forEach((w,i)=>{ wsW.getRow(wF+i).values=[w.date,w.work_order,w.requested_by,w.location,w.category,w.description,w.team,w.status,w.qty,w.hours,Number(w.amount||0),w.materials,w.follow_up]; });
-  { const r=wsW.getRow(wL+1); r.values=['TOTAL','','','','','','','',F(`SUM(${rng('I',wF,wL)})`,work.reduce((x,w)=>x+Number(w.qty||0),0)),F(`SUM(${rng('J',wF,wL)})`,work.reduce((x,w)=>x+Number(w.hours||0),0)),F(`SUM(${rng('K',wF,wL)})`,s.work.total)]; totalRow(r,1,13); }
-  fmt(wsW,[11],RPT.money,wF,wL+1);
+  const wsW = sheet('Work','WORK LOG',subLine,[7,12,16,16,24,26,40,14,14,7,9,14,34,11],3);
+  header(wsW,4,1,['S/N','Date','Work Order No.','Requested By','Location','Work Category','Work Description','Team','Job Status','Qty','Duration (Hrs)','Work Done (BD)','Site Details / Materials Used','Follow-up']);
+  const wF=5, wL=wF+Math.max(work.length,1)-1, wT=wL+1;
+  work.forEach((w,i)=>{ const n=wF+i; wsW.getRow(n).values=[F('ROW()-4',i+1), xd(w.date), w.work_order, w.requested_by, w.location, w.category, w.description, w.team, w.status, Number(w.qty||0), Number(w.hours||0), Number(w.amount||0), w.materials, w.follow_up]; bodyRow(wsW,n,1,14,i); });
+  wsW.getRow(wT).values=['TOTAL','','','','','','','','',F(`SUM(J${wF}:J${wL})`,work.reduce((x,w)=>x+Number(w.qty||0),0)),F(`SUM(K${wF}:K${wL})`,work.reduce((x,w)=>x+Number(w.hours||0),0)),F(`SUM(L${wF}:L${wL})`,s.work.total)]; totalsRow(wsW,wT,1,14);
+  nf(wsW,[2],RPT.date,wF,wL); nf(wsW,[12],RPT.money,wF,wT); nf(wsW,[11],RPT.hrs,wF,wT);
+  wsW.autoFilter={from:{row:4,column:1},to:{row:4,column:14}};
+  const W = c=>R('Work',c,wF,wL);
+
+  /* ---------- Manpower ---------- */
+  const otSplit = {}; q(`SELECT card_no, SUM(CASE WHEN status='Working' AND (type_day IS NULL OR type_day='' OR type_day='Normal') THEN COALESCE(ot_hours,0) ELSE 0 END) otn, SUM(CASE WHEN status='Working' AND NOT (type_day IS NULL OR type_day='' OR type_day='Normal') THEN COALESCE(ot_hours,0) ELSE 0 END) oth FROM attendance WHERE date>=? AND date<=? GROUP BY card_no`,[s.from,s.to]).forEach(r=> otSplit[r.card_no]=r);
+  const wsM = sheet('Manpower','MANPOWER & LABOUR COST',subLine+' · salaries are confidential',[7,10,30,15,16,20,9,9,12,11,12,10,11,11,12,10,11,13],3);
+  header(wsM,4,1,['S/N','Card No.','Name','Team','Project','Occupation','Days Worked','Duty Hours','Monthly Salary (BD)','Daily Salary (BD)','Basic Cost (BD)','OT Hrs (Normal)','OT Hrs (Fri / Holiday)','OT Rate / Hr (BD)','OT Cost (BD)','Food Allow.','Food Cost (BD)','Total Cost (BD)']);
+  const mF=5, mL=mF+Math.max(s.labor.length,1)-1, mT=mL+1;
+  s.labor.forEach((r,i)=>{ const n=mF+i, sp=otSplit[r.card_no]||{otn:0,oth:0};
+    wsM.getRow(n).values=[F('ROW()-4',i+1), r.card_no, r.name, r.team, r.project||'', r.occupation||'', r.days_worked, Number(r.hours||0), r.basic,
+      F(`I${n}/${DPM}`,r.daily), F(`G${n}*J${n}`,r.basic_cost), Number(sp.otn||0), Number(sp.oth||0), F(`J${n}/${HPD}*${OTM}`,r.ot_rate),
+      F(`(L${n}*${OTM}+M${n}*${OTH})*J${n}/${HPD}`,r.ot_cost), Number(r.food_n||0), F(`P${n}*${FOOD}`,r.food_cost), F(`K${n}+O${n}+Q${n}`,r.total)];
+    bodyRow(wsM,n,1,18,i); });
+  wsM.getRow(mT).values=['TOTAL','','','','','',F(`SUM(G${mF}:G${mL})`,s.labor.reduce((a,b)=>a+b.days_worked,0)),F(`SUM(H${mF}:H${mL})`,s.labor.reduce((a,b)=>a+Number(b.hours||0),0)),'','',F(`SUM(K${mF}:K${mL})`,s.laborTot.basic),F(`SUM(L${mF}:L${mL})`,s.labor.reduce((a,b)=>a+Number((otSplit[b.card_no]||{}).otn||0),0)),F(`SUM(M${mF}:M${mL})`,s.labor.reduce((a,b)=>a+Number((otSplit[b.card_no]||{}).oth||0),0)),'',F(`SUM(O${mF}:O${mL})`,s.laborTot.ot),F(`SUM(P${mF}:P${mL})`,s.labor.reduce((a,b)=>a+Number(b.food_n||0),0)),F(`SUM(Q${mF}:Q${mL})`,s.laborTot.food),F(`SUM(R${mF}:R${mL})`,s.laborTot.total)];
+  totalsRow(wsM,mT,1,18); nf(wsM,[9,10,11,14,15,17,18],RPT.money,mF,mT); nf(wsM,[8,12,13],RPT.hrs,mF,mT);
+  wsM.autoFilter={from:{row:4,column:1},to:{row:4,column:18}};
+  const M = c=>R('Manpower',c,mF,mL);
+
+  /* ---------- Asset Hire (one line per asset per day) ---------- */
+  const hire = []; s.veh.concat(s.eq).forEach(a=> (a.daily||[]).forEach(x=> hire.push({...x, label:a.label, team:canon(x.team)||'Unallocated'})));
+  hire.sort((p,q2)=> p.date<q2.date?-1:p.date>q2.date?1: (p.type<q2.type?-1:p.type>q2.type?1: String(p.ref).localeCompare(String(q2.ref))));
+  const wsA = sheet('Asset Hire','ASSET HIRE — DAILY LOG','Hire charged = rate in force that day × duty hours of the driver / team that day (day / month rates: per day hired). '+subLine,[7,12,11,12,34,15,16,12,11,9,10,13,9,10,12],5);
+  header(wsA,4,1,['S/N','Date','Asset Type','Ref','Description','Team','Project','Hours From','Hire Rate (BD)','Rate Per','Duty Hours','Hire Charged (BD)','Used','Hours Used','Idle Hire (BD)']);
+  const aF=5, aL=aF+Math.max(hire.length,1)-1, aT=aL+1;
+  hire.forEach((x,i)=>{ const n=aF+i; const idle = x.hours? x.cost*(1-(x.used?x.hours:0)/x.hours) : 0;
+    wsA.getRow(n).values=[F('ROW()-4',i+1), xd(x.date), x.type, x.ref, x.label, x.team, x.project||'', x.src, x.rate, x.basis, x.hours,
+      F(`IF(K${n}=0,0,IF(J${n}="hour",I${n}*K${n},IF(J${n}="day",I${n},I${n}/${DPM})))`,x.cost), x.used?'Yes':'No', F(`IF(M${n}="Yes",K${n},0)`,x.used?x.hours:0), F(`IF(K${n}=0,0,L${n}*(1-N${n}/K${n}))`,idle)];
+    bodyRow(wsA,n,1,15,i); });
+  wsA.getRow(aT).values=['TOTAL','','','','','','','','','',F(`SUM(K${aF}:K${aL})`,hire.reduce((p,x)=>p+x.hours,0)),F(`SUM(L${aF}:L${aL})`,s.hireTot.total),'',F(`SUM(N${aF}:N${aL})`,hire.reduce((p,x)=>p+(x.used?x.hours:0),0)),F(`SUM(O${aF}:O${aL})`,s.hireTot.idle)];
+  totalsRow(wsA,aT,1,15); nf(wsA,[2],RPT.date,aF,aL); nf(wsA,[9,12,15],RPT.money,aF,aT); nf(wsA,[11,14],RPT.hrs,aF,aT);
+  wsA.autoFilter={from:{row:4,column:1},to:{row:4,column:15}};
+  const AH = c=>R("'Asset Hire'",c,aF,aL);
 
   /* ---------- Expenses ---------- */
-  const wsE = wb.addWorksheet('Expenses', {views:[{state:'frozen', ySplit:1}]});
-  wsE.getRow(1).values=['Date','Category','Asset type','Asset ref','Team','Project','Amount (BD)','Note']; head(wsE,1,8);
-  [11,14,11,12,14,16,12,40].forEach((w,i)=>wsE.getColumn(i+1).width=w);
-  const eF=2, eL=eF+Math.max(s.expRows.length,1)-1;
-  s.expRows.forEach((r,i)=>{ wsE.getRow(eF+i).values=[r.date,r.category,r.asset_type,r.asset_ref,canon(r.team2)||'Unallocated',r.project||'',Number(r.amount||0),r.note]; });
-  { const r=wsE.getRow(eL+1); r.values=['TOTAL','','','','','',F(`SUM(${rng('G',eF,eL)})`,s.expTot)]; totalRow(r,1,8); }
-  fmt(wsE,[7],RPT.money,eF,eL+1);
+  const wsE = sheet('Expenses','FUEL, EXPENSES & MAINTENANCE',subLine,[7,12,14,11,12,15,16,13,46],2);
+  header(wsE,4,1,['S/N','Date','Category','Asset Type','Asset Ref','Team','Project','Amount (BD)','Note']);
+  const eF=5, eL=eF+Math.max(s.expRows.length,1)-1, eT=eL+1;
+  s.expRows.forEach((r,i)=>{ const n=eF+i; wsE.getRow(n).values=[F('ROW()-4',i+1), xd(r.date), r.category, r.asset_type||'', r.asset_ref||'', canon(r.team2)||'Unallocated', r.project||'', Number(r.amount||0), r.note||'']; bodyRow(wsE,n,1,9,i); });
+  wsE.getRow(eT).values=['TOTAL','','','','','','',F(`SUM(H${eF}:H${eL})`,s.expTot)]; totalsRow(wsE,eT,1,9);
+  nf(wsE,[2],RPT.date,eF,eL); nf(wsE,[8],RPT.money,eF,eT); wsE.autoFilter={from:{row:4,column:1},to:{row:4,column:9}};
+  const E = c=>R('Expenses',c,eF,eL);
 
   /* ---------- Purchases ---------- */
-  const wsP = wb.addWorksheet('Purchases', {views:[{state:'frozen', ySplit:1}]});
-  wsP.getRow(1).values=['Item','Qty received','Cost (BD)']; head(wsP,1,3); [36,12,14].forEach((w,i)=>wsP.getColumn(i+1).width=w);
-  const pF=2, pL=pF+Math.max(s.purchases.length,1)-1;
-  s.purchases.forEach((p,i)=>{ wsP.getRow(pF+i).values=[p.name,Number(p.qty||0),Number(p.cost||0)]; });
-  { const r=wsP.getRow(pL+1); r.values=['TOTAL',F(`SUM(${rng('B',pF,pL)})`,s.purchases.reduce((x,p)=>x+Number(p.qty||0),0)),F(`SUM(${rng('C',pF,pL)})`,s.purchTot)]; totalRow(r,1,3); }
-  fmt(wsP,[3],RPT.money,pF,pL+1);
+  const wsP = sheet('Purchases','STOCK PURCHASES (RECEIVED)',subLine+' · depot-wide, not allocated to a project or team',[7,40,14,14]);
+  header(wsP,4,1,['S/N','Item','Qty Received','Cost (BD)']);
+  const pF=5, pL=pF+Math.max(s.purchases.length,1)-1, pT=pL+1;
+  s.purchases.forEach((p,i)=>{ const n=pF+i; wsP.getRow(n).values=[F('ROW()-4',i+1), p.name, Number(p.qty||0), Number(p.cost||0)]; bodyRow(wsP,n,1,4,i); });
+  wsP.getRow(pT).values=['TOTAL','',F(`SUM(C${pF}:C${pL})`,s.purchases.reduce((x,p)=>x+Number(p.qty||0),0)),F(`SUM(D${pF}:D${pL})`,s.purchTot)]; totalsRow(wsP,pT,1,4);
+  nf(wsP,[4],RPT.money,pF,pT);
+  const P = c=>R('Purchases',c,pF,pL);
 
-  /* ---------- Report (first sheet) ---------- */
-  [3,34,16,16,14,14,14,14,14,14].forEach((w,i)=>ws.getColumn(i+1).width=w);
-  ws.getCell('B1').value='WORK & COST REPORT'; ws.getCell('B1').font={bold:true,size:14};
-  ws.getCell('B2').value='Site'; ws.getCell('C2').value=getSetting('site_name','DEPOT - BUDAIYA'); ws.getCell('D2').value='Project'; ws.getCell('E2').value=proj;
-  ws.getCell('B3').value='Period'; ws.getCell('C3').value=label; ws.getCell('D3').value='From'; ws.getCell('E3').value=s.from; ws.getCell('F3').value='To'; ws.getCell('G3').value=s.to;
-  ws.getCell('B5').value='ASSUMPTIONS (edit these — every sheet recalculates)'; ws.getCell('B5').font={bold:true};
-  [['Days per month',dpm],['Hours per day',hpd],['OT multiplier (normal day)',mult],['OT multiplier (Friday / holiday)',hmult],['Food allowance rate (BD)',food],['Hire hours per day (hourly rates)',hh]].forEach(([k,v],i)=>{ ws.getCell(6+i,2).value=k; ws.getCell(6+i,3).value=v; ws.getCell(6+i,3).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FFFFF2CC'}}; ws.getCell(6+i,3).border=thin(); });
-  const M=(c)=>`Manpower!$${c}$${mF}:$${c}$${mL}`, A=(c)=>`Assets!$${c}$${aF}:$${c}$${aL}`, W=(c)=>`Work!$${c}$${wF}:$${c}$${wL}`, E=(c)=>`Expenses!$${c}$${eF}:$${c}$${eL}`, P=(c)=>`Purchases!$${c}$${pF}:$${c}$${pL}`;
-  let r=13; ws.getRow(r).values=['','Cost element','Amount (BD)','% of work done']; styleHeader(ws.getRow(r),2,4); r++;
-  const lines=[
-    ['WORK DONE (value of jobs)', F(`SUM(${W('K')})`,s.work.total), null],
-    ['Manpower — basic', F(`SUM(${M('L')})`,s.laborTot.basic)],
-    ['Manpower — overtime', F(`SUM(${M('P')})`,s.laborTot.ot)],
-    ['Manpower — food allowance', F(`SUM(${M('R')})`,s.laborTot.food)],
-    ['Vehicle hire', F(`SUMIF(${A('A')},"Vehicle",${A('J')})`,s.hireTot.veh)],
-    ['Equipment hire', F(`SUMIF(${A('A')},"Equipment",${A('J')})`,s.hireTot.eq)],
-    ['   of which idle hire (assets hired but not used — information only)', F(`SUM(${A('M')})`,s.hireTot.idle)],
-    ['Fuel', F(`SUMIF(${E('B')},"Fuel",${E('G')})`,s.fuelTot)],
-    ['Other expenses (incl. maintenance parts & labour)', F(`SUM(${E('G')})-C21`,s.expTot-s.fuelTot)],
-    ['Stock purchases (received)', F(`SUM(${P('C')})`,s.purchTot)],
-    ['TOTAL COST', F(`C15+C16+C17+C18+C19+C21+C22+C23`,s.cost)],
-    ['NET PROFIT', F(`C14-C24`,s.net)],
-    ['MARGIN', F(`IFERROR(C25/C14,0)`,s.margin===null?0:s.margin)],
-    ['Jobs completed', F(`COUNTIF(${W('H')},"Completed")`,s.work.done)],
-    ['Jobs logged', F(`COUNTA(${W('A')})`,work.length)]
-  ];
-  lines.forEach((l,i)=>{ const n=r+i; ws.getCell(n,2).value=l[0]; ws.getCell(n,3).value=l[1]; ws.getCell(n,3).numFmt = n===26?RPT.pct:(n>=27?RPT.int:RPT.money);
-    if(l[2]===undefined && n!==26 && n<27 && n!==20){ ws.getCell(n,4).value=F(`IFERROR(C${n}/$C$14,0)`,s.work.total?l[1].result/s.work.total:0); ws.getCell(n,4).numFmt=RPT.pct; }
-    for(let c=2;c<=4;c++) ws.getCell(n,c).border=thin();
-    if([14,24,25,26].includes(n)) for(let c=2;c<=4;c++) ws.getCell(n,c).font={bold:true}; });
-  r += lines.length + 1;
-  ws.getCell(r,2).value='WORK DONE BY CATEGORY'; ws.getCell(r,2).font={bold:true}; r++;
-  ws.getRow(r).values=['','Category','Jobs','Completed','Qty','Amount (BD)','% of total']; styleHeader(ws.getRow(r),2,7); r++;
-  s.workByCat.forEach((c,i)=>{ const n=r+i; ws.getRow(n).values=['',c.category,F(`COUNTIF(${W('E')},B${n})`,c.jobs),F(`COUNTIFS(${W('E')},B${n},${W('H')},"Completed")`,c.done),F(`SUMIF(${W('E')},B${n},${W('I')})`,c.qty),F(`SUMIF(${W('E')},B${n},${W('K')})`,c.amount),F(`IFERROR(F${n}/$C$14,0)`,s.work.total?c.amount/s.work.total:0)]; ws.getCell(n,6).numFmt=RPT.money; ws.getCell(n,7).numFmt=RPT.pct; zebra(ws.getRow(n),2,7,i); });
-  r += Math.max(s.workByCat.length,0) + 1;
-  ws.getCell(r,2).value='TEAM PERFORMANCE'; ws.getCell(r,2).font={bold:true}; r++;
-  ws.getRow(r).values=['','Team','Staff','Jobs','Work done','Manpower','Asset hire','Expenses','Total cost','Net','Margin']; styleHeader(ws.getRow(r),2,11); r++;
-  const tF=r;
-  s.teams.forEach((t,i)=>{ const n=r+i; ws.getRow(n).values=['',t.team,F(`COUNTIFS(${M('D')},B${n},${M('G')},">0")`,t.staff),F(`COUNTIF(${W('G')},B${n})`,t.jobs),F(`SUMIF(${W('G')},B${n},${W('K')})`,t.work),F(`SUMIF(${M('D')},B${n},${M('S')})`,t.labor),F(`SUMIF(${A('D')},B${n},${A('J')})`,t.hire),F(`SUMIF(${E('E')},B${n},${E('G')})`,t.exp),F(`F${n}+G${n}+H${n}`,t.cost),F(`E${n}-I${n}`,t.net),F(`IFERROR(J${n}/E${n},0)`,t.margin===null?0:t.margin)]; [5,6,7,8,9,10].forEach(c=>ws.getCell(n,c).numFmt=RPT.money); ws.getCell(n,11).numFmt=RPT.pct; zebra(ws.getRow(n),2,11,i); });
-  { const n=r+Math.max(s.teams.length,1); const tL=n-1; const row=ws.getRow(n); row.values=['','TOTAL',F(`SUM(C${tF}:C${tL})`,s.laborTot.staff),F(`SUM(D${tF}:D${tL})`,s.work.jobs),F(`SUM(E${tF}:E${tL})`,s.work.total),F(`SUM(F${tF}:F${tL})`,s.laborTot.total),F(`SUM(G${tF}:G${tL})`,s.hireTot.total),F(`SUM(H${tF}:H${tL})`,s.expTot),F(`SUM(I${tF}:I${tL})`,s.laborTot.total+s.hireTot.total+s.expTot),F(`E${n}-I${n}`,s.work.total-s.laborTot.total-s.hireTot.total-s.expTot),F(`IFERROR(J${n}/E${n},0)`,s.work.total?(s.work.total-s.laborTot.total-s.hireTot.total-s.expTot)/s.work.total:0)]; [5,6,7,8,9,10].forEach(c=>ws.getCell(n,c).numFmt=RPT.money); ws.getCell(n,11).numFmt=RPT.pct; totalRow(row,2,11); r=n+2; }
-  ws.getCell(r,2).value = COST_PROJECT ? `Project filter: ${COST_PROJECT} — manpower, asset hire and asset expenses are limited to this project; work done and stock purchases are not project-specific and show the whole depot.` : 'All projects. Every figure on this sheet is a formula over the detail sheets — edit any input or detail row and the report recalculates.';
-  ws.getCell(r,2).font={italic:true,color:{argb:'FF666666'}};
-  ws.pageSetup={orientation:'portrait', fitToPage:true, fitToWidth:1, fitToHeight:0};
+  /* ---------- Report (dashboard) ---------- */
+  [2,30,14,14,14,14,14,14,14,14,14].forEach((w,i)=> ws.getColumn(i+1).width=w);
+  ws.mergeCells('B2:K2'); ws.getCell('B2').value='WORK & COST ANALYSIS'; font(ws.getCell('B2'),{bold:true,size:20,color:{argb:K.title}}); ws.getRow(2).height=30;
+  ws.mergeCells('B3:K3'); ws.getCell('B3').value=`${site} · ${label}`; font(ws.getCell('B3'),{size:9,italic:true,color:{argb:K.muted}});
+  const infoL=[['B','C','REPORTING PERIOD',period],['D','E','SITE',site],['F','G','PROJECT',proj],['H','I','PREPARED BY',preparedBy],['J','K','GENERATED',new Date().toLocaleString()]];
+  infoL.forEach(([a,b,l,v])=>{ ws.mergeCells(`${a}4:${b}4`); ws.mergeCells(`${a}5:${b}5`); ws.getCell(a+'4').value=l; font(ws.getCell(a+'4'),{bold:true,size:8,color:{argb:K.muted}}); ws.getCell(a+'5').value=v; font(ws.getCell(a+'5'),{bold:true,size:10}); });
+  // KPI boxes
+  const WD='$B$8';
+  const CB=13;  // first body row of the two side tables
+  const costRows=['Manpower — basic','Manpower — overtime','Manpower — food allowance','Vehicle hire','Equipment hire','Fuel','Other expenses & maint.','Stock purchases','TOTAL COST','NET PROFIT','MARGIN','Idle hire (hired, not used)'];
+  const cr = n=> CB+costRows.indexOf(n);   // row of a cost element
+  const kpis=[['B','C','WORK DONE',F(`SUM(${W('L')})`,s.work.total),RPT.moneyBD,'value of jobs logged'],
+              ['D','E','TOTAL COST',F(`J${cr('TOTAL COST')}`,s.cost),RPT.moneyBD,'all cost elements'],
+              ['F','G','NET PROFIT',F(`J${cr('NET PROFIT')}`,s.net),RPT.moneyBD,'work done − total cost'],
+              ['H','I','MARGIN',F(`J${cr('MARGIN')}`,s.margin===null?0:s.margin),RPT.pct,'net profit ÷ work done'],
+              ['J','K','JOBS COMPLETED',F(`COUNTIF(${W('I')},"Completed")`,s.work.done),RPT.int,null]];
+  kpis.forEach(([a,b,l,v,f,sub])=>{ [7,8,9].forEach(r=>ws.mergeCells(`${a}${r}:${b}${r}`));
+    const lc=ws.getCell(a+'7'), vc=ws.getCell(a+'8'), sc=ws.getCell(a+'9');
+    lc.value=l; font(lc,{bold:true,size:9,color:{argb:K.muted}}); vc.value=v; vc.numFmt=f; font(vc,{bold:true,size:18,color:{argb:K.title}}); sc.value = sub===null ? F(`"of "&COUNTA(${W('B')})&" jobs logged"`,`of ${work.length} jobs logged`) : sub; font(sc,{size:8,italic:true,color:{argb:K.muted}});
+    [lc,vc,sc].forEach(c=>{ c.fill=fill(K.zebra); c.alignment={horizontal:'center',vertical:'middle'}; });
+    [7,8,9].forEach(r=>[a,b].forEach(col=>{ const c=ws.getCell(col+r); c.fill=fill(K.zebra); c.border={top:r===7?{style:'thin',color:{argb:K.line}}:undefined,bottom:r===9?{style:'thin',color:{argb:K.line}}:undefined,left:col===a?{style:'thin',color:{argb:K.line}}:undefined,right:col===b?{style:'thin',color:{argb:K.line}}:undefined}; })); });
+  ws.getRow(7).height=16; ws.getRow(8).height=30; ws.getRow(9).height=14;
+  // Work done by category (left) + cost breakdown (right)
+  band(ws,11,2,6,'WORK DONE BY CATEGORY'); band(ws,11,8,11,'COST BREAKDOWN');
+  header(ws,12,2,['Work Category','Jobs','Completed','Amount (BD)','% of Total']); header(ws,12,8,['Cost Element','','Amount (BD)','% of Work Done']); ws.mergeCells(12,8,12,9);
+  const cats = s.workByCat.length ? s.workByCat : [];
+  cats.forEach((c,i)=>{ const n=CB+i; ws.getCell(n,2).value=c.category||'Other'; ws.getCell(n,3).value=F(`COUNTIF(${W('F')},B${n})`,c.jobs); ws.getCell(n,4).value=F(`COUNTIFS(${W('F')},B${n},${W('I')},"Completed")`,c.done); ws.getCell(n,5).value=F(`SUMIF(${W('F')},B${n},${W('L')})`,Number(c.amount||0)); ws.getCell(n,6).value=F(`IFERROR(E${n}/${WD},0)`,s.work.total?Number(c.amount||0)/s.work.total:0); ws.getCell(n,5).numFmt=RPT.money; ws.getCell(n,6).numFmt=RPT.pct; bodyRow(ws,n,2,6,i); });
+  const catT = CB+cats.length; ws.getCell(catT,2).value='TOTAL'; ws.getCell(catT,3).value=F(`SUM(C${CB}:C${Math.max(CB,catT-1)})`,s.work.jobs); ws.getCell(catT,4).value=F(`SUM(D${CB}:D${Math.max(CB,catT-1)})`,s.work.done); ws.getCell(catT,5).value=F(`SUM(E${CB}:E${Math.max(CB,catT-1)})`,s.work.total); ws.getCell(catT,6).value=F(`IFERROR(E${catT}/${WD},0)`,s.work.total?1:0); ws.getCell(catT,5).numFmt=RPT.money; ws.getCell(catT,6).numFmt=RPT.pct; totalsRow(ws,catT,2,6);
+  const costF = {
+    'Manpower — basic':[`SUM(${M('K')})`,s.laborTot.basic], 'Manpower — overtime':[`SUM(${M('O')})`,s.laborTot.ot], 'Manpower — food allowance':[`SUM(${M('Q')})`,s.laborTot.food],
+    'Vehicle hire':[`SUMIF(${AH('C')},"Vehicle",${AH('L')})`,s.hireTot.veh], 'Equipment hire':[`SUMIF(${AH('C')},"Equipment",${AH('L')})`,s.hireTot.eq],
+    'Fuel':[`SUMIF(${E('C')},"Fuel",${E('H')})`,s.fuelTot], 'Other expenses & maint.':[`SUM(${E('H')})-J${cr('Fuel')}`,s.expTot-s.fuelTot], 'Stock purchases':[`SUM(${P('D')})`,s.purchTot],
+    'TOTAL COST':[`SUM(J${CB}:J${cr('Stock purchases')})`,s.cost], 'NET PROFIT':[`${WD}-J${cr('TOTAL COST')}`,s.net], 'MARGIN':[`IFERROR(J${cr('NET PROFIT')}/${WD},0)`,s.margin===null?0:s.margin],
+    'Idle hire (hired, not used)':[`SUM(${AH('O')})`,s.hireTot.idle] };
+  costRows.forEach((name,i)=>{ const n=CB+i, [f,v]=costF[name]; ws.mergeCells(n,8,n,9); ws.getCell(n,8).value=name; ws.getCell(n,10).value=F(f,v); ws.getCell(n,10).numFmt = name==='MARGIN'?RPT.pct:RPT.money;
+    if(name!=='MARGIN'){ ws.getCell(n,11).value=F(`IFERROR(J${n}/${WD},0)`,s.work.total?v/s.work.total:0); ws.getCell(n,11).numFmt=RPT.pct; }
+    if(['TOTAL COST','NET PROFIT'].includes(name)) totalsRow(ws,n,8,11); else bodyRow(ws,n,8,11,i);
+    if(name.startsWith('Idle')) [8,10,11].forEach(c=>font(ws.getCell(n,c),{italic:true,size:9,color:{argb:K.muted}})); });
+  // Team performance
+  let r0 = Math.max(catT, CB+costRows.length-1) + 3;
+  band(ws,r0,2,11,'TEAM PERFORMANCE'); header(ws,r0+1,2,['Team','Staff','Jobs','Work Done (BD)','Manpower (BD)','Asset Hire (BD)','Expenses (BD)','Total Cost (BD)','Net (BD)','Margin %']);
+  const tF=r0+2; s.teams.forEach((t,i)=>{ const n=tF+i;
+    ws.getRow(n).values=['',t.team,F(`COUNTIFS(${M('D')},B${n},${M('G')},">0")`,t.staff),F(`COUNTIF(${W('H')},B${n})`,t.jobs),F(`SUMIF(${W('H')},B${n},${W('L')})`,t.work),F(`SUMIF(${M('D')},B${n},${M('R')})`,t.labor),F(`SUMIF(${AH('F')},B${n},${AH('L')})`,t.hire),F(`SUMIF(${E('F')},B${n},${E('H')})`,t.exp),F(`F${n}+G${n}+H${n}`,t.cost),F(`E${n}-I${n}`,t.net),F(`IFERROR(J${n}/E${n},0)`,t.margin===null?0:t.margin)];
+    [5,6,7,8,9,10].forEach(c=>ws.getCell(n,c).numFmt=RPT.money); ws.getCell(n,11).numFmt=RPT.pct; bodyRow(ws,n,2,11,i); });
+  const tL=tF+Math.max(s.teams.length,1)-1, tT=tL+1;
+  { const tc=s.laborTot.total+s.hireTot.total+s.expTot, tn=s.work.total-tc;
+    ws.getRow(tT).values=['','TOTAL',F(`SUM(C${tF}:C${tL})`,s.laborTot.staff),F(`SUM(D${tF}:D${tL})`,s.work.jobs),F(`SUM(E${tF}:E${tL})`,s.work.total),F(`SUM(F${tF}:F${tL})`,s.laborTot.total),F(`SUM(G${tF}:G${tL})`,s.hireTot.total),F(`SUM(H${tF}:H${tL})`,s.expTot),F(`SUM(I${tF}:I${tL})`,tc),F(`E${tT}-I${tT}`,tn),F(`IFERROR(J${tT}/E${tT},0)`,s.work.total?tn/s.work.total:0)];
+    [5,6,7,8,9,10].forEach(c=>ws.getCell(tT,c).numFmt=RPT.money); ws.getCell(tT,11).numFmt=RPT.pct; totalsRow(ws,tT,2,11); }
+  ws.mergeCells(tT+1,2,tT+1,11); ws.getCell(tT+1,2).value='Stock purchases are depot-wide and are not allocated to teams, so team total cost excludes them.'; font(ws.getCell(tT+1,2),{italic:true,size:8,color:{argb:K.muted}});
+  // Asset hire & utilisation
+  r0 = tT+3; band(ws,r0,2,9,'ASSET HIRE & UTILISATION'); header(ws,r0+1,2,['Asset Type','Assets','Asset-Days','Duty Hours','Hours Used','Utilisation %','Hire (BD)','Idle Hire (BD)']);
+  const uF=r0+2; ['Vehicle','Equipment'].forEach((type,i)=>{ const n=uF+i, rows=hire.filter(x=>x.type===type), hrs=rows.reduce((p,x)=>p+x.hours,0), uh=rows.reduce((p,x)=>p+(x.used?x.hours:0),0);
+    ws.getRow(n).values=['',type,F(`SUMPRODUCT((${AH('C')}=B${n})/COUNTIFS(${AH('C')},${AH('C')},${AH('D')},${AH('D')}))`,new Set(rows.map(x=>x.ref)).size),F(`COUNTIFS(${AH('C')},B${n},${AH('K')},">0")`,rows.length),F(`SUMIF(${AH('C')},B${n},${AH('K')})`,hrs),F(`SUMIF(${AH('C')},B${n},${AH('N')})`,uh),F(`IFERROR(F${n}/E${n},0)`,hrs?uh/hrs:0),F(`SUMIF(${AH('C')},B${n},${AH('L')})`,rows.reduce((p,x)=>p+x.cost,0)),F(`SUMIF(${AH('C')},B${n},${AH('O')})`,rows.reduce((p,x)=>p+(x.hours?x.cost*(1-(x.used?x.hours:0)/x.hours):0),0))];
+    [5,6].forEach(c=>ws.getCell(n,c).numFmt=RPT.hrs); ws.getCell(n,7).numFmt=RPT.pct; [8,9].forEach(c=>ws.getCell(n,c).numFmt=RPT.money); bodyRow(ws,n,2,9,i); });
+  { const n=uF+2, hrs=hire.reduce((p,x)=>p+x.hours,0), uh=hire.reduce((p,x)=>p+(x.used?x.hours:0),0);
+    ws.getRow(n).values=['','TOTAL',F(`SUM(C${uF}:C${n-1})`,new Set(hire.map(x=>x.type+x.ref)).size),F(`SUM(D${uF}:D${n-1})`,hire.length),F(`SUM(E${uF}:E${n-1})`,hrs),F(`SUM(F${uF}:F${n-1})`,uh),F(`IFERROR(F${n}/E${n},0)`,hrs?uh/hrs:0),F(`SUM(H${uF}:H${n-1})`,s.hireTot.total),F(`SUM(I${uF}:I${n-1})`,s.hireTot.idle)];
+    [5,6].forEach(c=>ws.getCell(n,c).numFmt=RPT.hrs); ws.getCell(n,7).numFmt=RPT.pct; [8,9].forEach(c=>ws.getCell(n,c).numFmt=RPT.money); totalsRow(ws,n,2,9); r0=n; }
+  // Job status (left) + how it is calculated (right)
+  r0 += 3; band(ws,r0,2,5,'JOB STATUS');
+  header(ws,r0+1,2,['Status','Jobs','Amount (BD)','% of Jobs']);
+  const statuses=[...new Set(work.map(w=>w.status||''))].filter(Boolean).sort(); const jF=r0+2;
+  statuses.forEach((st,i)=>{ const n=jF+i, rows=work.filter(w=>w.status===st); ws.getRow(n).getCell(2).value=st; ws.getCell(n,3).value=F(`COUNTIF(${W('I')},B${n})`,rows.length); ws.getCell(n,4).value=F(`SUMIF(${W('I')},B${n},${W('L')})`,rows.reduce((p,w)=>p+Number(w.amount||0),0)); ws.getCell(n,5).value=F(`IFERROR(C${n}/COUNTA(${W('B')}),0)`,work.length?rows.length/work.length:0); ws.getCell(n,4).numFmt=RPT.money; ws.getCell(n,5).numFmt=RPT.pct; bodyRow(ws,n,2,5,i); });
+  const jT=jF+statuses.length; ws.getCell(jT,2).value='TOTAL'; ws.getCell(jT,3).value=F(`SUM(C${jF}:C${Math.max(jF,jT-1)})`,work.length); ws.getCell(jT,4).value=F(`SUM(D${jF}:D${Math.max(jF,jT-1)})`,s.work.total); ws.getCell(jT,5).value=F(`IFERROR(C${jT}/COUNTA(${W('B')}),0)`,work.length?1:0); ws.getCell(jT,4).numFmt=RPT.money; ws.getCell(jT,5).numFmt=RPT.pct; totalsRow(ws,jT,2,5);
+  const notes=['Every figure on this sheet is a live formula over the detail tabs — edit any row and it recalculates.',
+    'Manpower: daily salary × days worked + overtime (normal / holiday multipliers) + food allowance. Inputs are on the Assumptions tab.',
+    'Asset hire: for each day, the hire rate in force that day × the duty hours of the vehicle\'s driver or the asset\'s team from the timesheet; the default hours apply when neither is on the timesheet.',
+    'A rate change in the app applies from the day it is made — earlier days in this report keep the rate that was in force.',
+    COST_PROJECT ? `Project filter "${COST_PROJECT}": manpower, asset hire and expenses are limited to this project; work done and stock purchases are depot-wide.` : 'All projects are included.'];
+  const nB = jT+3; band(ws,nB,2,11,'HOW THIS REPORT IS CALCULATED');
+  notes.forEach((t,i)=>{ const n=nB+1+i; ws.mergeCells(n,2,n,11); const c=ws.getCell(n,2); c.value='•  '+t; font(c,{size:9,color:{argb:K.muted}}); c.alignment={wrapText:true,vertical:'middle'}; ws.getRow(n).height = t.length>120 ? 26 : 16; });
+  const lastRow = nB+notes.length;
+  ws.pageSetup={orientation:'portrait', fitToPage:true, fitToWidth:1, fitToHeight:0, paperSize:9, margins:{left:0.4,right:0.4,top:0.5,bottom:0.5,header:0.2,footer:0.2}};
+  ws.pageSetup.printArea=`A1:K${lastRow+1}`;
+  wb.eachSheet(sh=>{ sh.eachRow({includeEmpty:false}, row=> row.eachCell({includeEmpty:false}, c=>{ if(!c.font || c.font.name!=='Tahoma') c.font=Object.assign({size:10}, c.font||{}, {name:'Tahoma'}); })); });
 
   const buf = await wb.xlsx.writeBuffer();
   download(`cost-analysis-${s.from}${s.from!==s.to?'-to-'+s.to:''}${COST_PROJECT?'-'+COST_PROJECT.replace(/[^\w]+/g,'_'):''}.xlsx`, new Blob([buf],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
-  toast('Cost analysis workbook downloaded (with live formulas)','good');
+  toast('Cost analysis workbook downloaded (live formulas)','good');
   }catch(e){ console.error(e); toast('Could not build the workbook: '+e.message,'bad'); }
 }
 
@@ -3025,7 +3227,7 @@ function renderData(){
         <div class="field"><label>OT multiplier (normal day)</label><input class="inp" data-set="ot_multiplier" type="number" step="any" value="${st('ot_multiplier')}"></div>
         <div class="field"><label>OT multiplier (Friday / holiday)</label><input class="inp" data-set="holiday_multiplier" type="number" step="any" value="${st('holiday_multiplier')}"></div>
         <div class="field"><label>Food allowance (BD per allowance)</label><input class="inp" data-set="food_rate" type="number" step="0.001" value="${st('food_rate')}"></div>
-        <div class="field"><label>Hire hours per day (for hourly rates)</label><input class="inp" data-set="hire_hours_per_day" type="number" step="any" value="${st('hire_hours_per_day')}"></div>
+        <div class="field"><label>Standard duty hours per day — a daily hire rate buys this many hours; longer duty days are charged pro-rata by the hour</label><input class="inp" data-set="hire_hours_per_day" type="number" step="any" value="${st('hire_hours_per_day')}"></div>
         <div class="field"><label>Charge basic salary for</label><select class="sel" data-set="charge_basic"><option value="attended" ${st('charge_basic')==='attended'?'selected':''}>days marked Working only</option><option value="all" ${st('charge_basic')==='all'?'selected':''}>every day in the timesheet</option></select></div>
         <div class="field"><label>Warn when out for more than (days)</label><input class="inp" data-set="overdue_days" type="number" value="${st('overdue_days')}"></div>
       </div>

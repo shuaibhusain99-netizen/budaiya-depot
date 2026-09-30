@@ -1202,7 +1202,7 @@ const RPT = {
   band:'FF1F3864', head:'FF2F5597', zebra:'FFF4F7FB', total:'FFD6DCE4', white:'FFFFFFFF',
   money:'#,##0.000', moneyBD:'#,##0.000 "BD"', int:'#,##0', pct:'0.0%', hrs:'#,##0.0', date:'dd-mmm-yyyy'
 };
-const RPT_CATEGORIES = ['Leakage (Main & service line)','Short Water / No Water','Meter Defect','','','',];   // 6 slots + Other, as in the reference
+const RPT_CATEGORIES = ['Leakage (Main & service line)','Short Water / No Water','Meter Defect','Reinstatement','','',];   // 6 slots + Other, as in the reference
 const RPT_STATUSES = ['Resolved','Partially Completed','Postponed','Not Completed - Access','Not Completed - Address','Cancelled'];
 const FAULT_PRICES = [['Leak 20 mm','A1',26.2],['Leak 32 mm','A2',40],['Leak 63 mm','A3',47.6],['Leak 150 mm','A4',71.4],['Leak 200 mm','A4',71.4],['Leak 150 mm - Replacement','A5',171.6],['Leak 200 mm - Replacement','A5',171.6],['Leak 250 mm','A6',160.8],['Leak 300 mm','A6',160.8],['Leak 400 mm','A6',160.8],['Leak 500 mm','A6',160.8],['Leak 600 mm','A6',160.8],['Leak 250 mm - Replacement','A7',256.2],['Leak 300 mm - Replacement','A7',256.2],['Leak 400 mm - Replacement','A7',256.2],['Leak 500 mm - Replacement','A7',256.2],['Leak 600 mm - Replacement','A7',256.2],['Leak 150 mm - Ferrule Replacement','A8',23.2],['Leak 200 mm - Ferrule Replacement','A8',23.2],['Leak 250 mm - Ferrule Replacement','A9',29.8],['Leak 300 mm - Ferrule Replacement','A9',29.8],['Leak 400 mm - Ferrule Replacement','A9',29.8],['Leak 500 mm - Ferrule Replacement','A9',29.8],['Leak 600 mm - Ferrule Replacement','A9',29.8],['Leak 63mm-Sluice Valve','B1',56.8],['Leak 100mm-Sluice Valve','B2',161.8],['Leak 150mm-Sluice Valve','B2',161.8],['Leak 200mm-Sluice Valve','B2',161.8],['Leak 250mm-Sluice Valve','B3',209.8],['Leak 300mm-Sluice Valve','B3',209.8],['Leak 400mm-Sluice Valve','B3',209.8],['Leak 500mm-Sluice Valve','B3',209.8],['Leak 600mm-Sluice Valve','B3',209.8],['FH Close','B4',19.4],['FH Replacement','B5',160.7],['FH Replacement With Chamber','B6',226.4],['Air Valve Close','B7',43.8],['Air Valve -Replacement','B8',176.1],['Water Meter-20 MM','C1',12.2],['Water Meter - 20 MM','C1',12.2],['Water Meter-32 MM','C2',15.2],['Water Meter - 32 MM','C2',15.2],['Water Meter-63 MM','C3',21.2],['Meter Fittings-20 MM','C4',11.3],['Meter Fittings 20 MM','C4',11.3],['Meter Fittings-32 MM','C5',15.2],['Meter Fittings 32 MM','C5',15.2],['Meter Fittings-63 MM','C6',21.2],['Meter Fittings 63 MM','C6',21.2],['Water Quality','D1',13.2],['Water Quality with Flushing','D2',104.6],['Customer Problem','E1',12.2],['Pressure is Checked and is OK','E1',12.2],['Leak after the Meter','E1',12.2],['No Ground tank','E1',12.2],['Customer Ground Tank Float Ball Stuck','E1',12.2],['Ground tank too high','E1',12.2],['pump not working','E1',12.2],['Roof tank insufficient Storage','E1',12.2],['Customer Valve closed','E1',12.2],['Site visit','E1',12.2],['Network Problem','E2',25.6],['Trial Holes','E3',23.1],['TSE Pipe Leakage','E3',23.1],['Gardern Pipe Leakage','E3',23.1],['Sewer Pipe Leakage','E3',23.1],['Rain Water','E3',23.1],['No Leakage found','E3',23.1],['Work Not related For WDD','E3',23.1],['Service Pipe Blockage','E3',23.1],['Service Disconnected','E3',23.1],['Meter Stolen','E3',23.1],['Meter Stoped','E3',23.1],['Work related to other Section','E3',23.1],['Road Settlement -No Leakage','E3',23.1],['Lean Mix Concrete','F',54.6],['Water Tankers for De-watering','G',26.6],['Tanker For Heavy Driver& Helper','H1',2.8],['Supply of Portable Water Tanker','H2',8.8],['Others','No pack','No Price'],['Planned Shutdown','No pack','No Price'],['Unplanned Shutdown','No pack','No Price']];
 /* fault text -> "Complaint Nature" category used by the report */
@@ -3107,13 +3107,56 @@ function insertWork(r){
   insertRow('work_log',{date:xlDate(r['Date']), work_order:S(r['Work Order No.']), requested_by:S(r['Requested By']), location:loc, category:cat||'Other', description:S(r['Work Description']), team:S(r['Team']), status:S(r['Job Status'])||'Completed', qty:N(r['Qty'])||1, hours:N(r['Duration (Hrs)']), amount:N(r['Work Done Amount (BD)']), materials:S(r['Site Details / Materials Used']), follow_up:S(r['Follow-up Required'])||'NO'});
   return true;
 }
+/* Reinstatement-Cost-Report-….xlsx (daily export, cumulative). Sheet "ASPHALT" = one row per excavation reinstatement,
+   sheet "Rates" = BOQ rates per depot (R1…R10b). Each row becomes a job in the Work log keyed by Excavation No, so
+   uploading the next day's export simply updates what changed. Cost is recomputed from the file's own Rates sheet with
+   the same formulas as the report (fallback: the file's Total). Team: Bricks / Concrete / Kerb Stone → Interlock, Asphalt → Asphalt. */
+const REINST_TEAM = {bricks:'Interlock', concrete:'Interlock', 'kerb stone':'Interlock', kerb:'Interlock', interlock:'Interlock', asphalt:'Asphalt'};
+function importReinstatement(wb){
+  const sheet = wb.SheetNames.find(n=>/asphalt|data/i.test(n)) || wb.SheetNames[0];
+  const rs = rowsOf(wb, sheet, 'Excavation No') || [];
+  const rates = {}; (rowsOf(wb,'Rates')||[]).forEach(r=>{ const d=S(r['Depot']).toLowerCase(); if(d) rates[d]=r; });
+  const R = (depot, code)=>{ const r = rates[String(depot||'').toLowerCase()] || rates['budaiya'] || Object.values(rates)[0] || {}; return N(r[code]); };
+  const num = v=> (v===''||v===null||v===undefined) ? 0 : (Number(v)||0);
+  let n=0;
+  rs.forEach(r=>{
+    const exc = S(r['Excavation No']); if(!exc) return;
+    const type = S(r['Type']); const t = type.toLowerCase();
+    const team = normalizeTeam(REINST_TEAM[t] || (/brick|concrete|kerb|interlock/.test(t) ? 'Interlock' : /asphalt/.test(t) ? 'Asphalt' : ''));
+    const depot = S(r['Depot']) || 'BUDAIYA';
+    const L=num(r['Length (m)']), W=num(r['Width (m)']), T=num(r['Thickness (cm)']), RB=num(r['Road Base Thickness (cm)']), milling=/^y/i.test(S(r['Milling']));
+    const area=L*W, vol=area*T/100, rbVol=area*RB/100;
+    const oldK=num(r['No. Old Kerbs']), newK=num(r['No. New Kerbs']), y60=num(r['No. New 60mm Yellow Bricks']), o60=num(r['No. New 60mm Other Color Bricks']), y80=num(r['No. New 80mm Yellow Bricks']), o80=num(r['No. New 80mm Other Color Bricks']);
+    let cost = 0;
+    if(Object.keys(rates).length){
+      cost += rbVol*R(depot,'R8');
+      if(t==='concrete') cost += vol*R(depot,'R9');
+      cost += oldK*0.914*R(depot,'R10B') + newK*0.914*R(depot,'R10a');
+      cost += 0.1*0.2*(R(depot,'R5a')*y60 + R(depot,'R5b')*o60 + R(depot,'R6a')*y80 + R(depot,'R6b')*o80);
+      if(t==='bricks' && T===6) cost += area*R(depot,'R3a');
+      if(t==='bricks' && T===8) cost += area*R(depot,'R3b');
+      if(t==='asphalt') cost += milling ? (area<100 ? area*R(depot,'R2a') : area*R(depot,'R2b')) : vol*R(depot,'R1');
+    } else cost = num(r['Total']);
+    cost = Math.round(cost*1000)/1000;
+    if(!type || t==='excavation' || (cost<=0 && area<=0)) { run('DELETE FROM work_log WHERE work_order=? AND category=?',[exc,'Reinstatement']); return; }   // excavated, not reinstated yet
+    const date = xlDate(r['Date Received']) || todayStr();
+    const areaName = S(r['Area']);
+    const loc = [areaName, r['House']!==''?'Bldg '+S(r['House']):'', r['Road']!==''?'Rd '+S(r['Road']):'', r['Block']!==''?'Blk '+S(r['Block']):''].filter(Boolean).join(', ');
+    const parts = [`${type} reinstatement`, area?`${L}×${W} m`:'' , T?`${T} cm`:'', milling?'milling':'', newK?`${newK} new kerb`:'', oldK?`${oldK} old kerb`:'', (y60+o60)?`${y60+o60}× 60mm bricks`:'', (y80+o80)?`${y80+o80}× 80mm bricks`:''].filter(Boolean);
+    run('DELETE FROM work_log WHERE work_order=?',[exc]);
+    insertRow('work_log',{date, work_order:exc, requested_by:depot, depot, location:loc, category:'Reinstatement', description:parts.join(' · '), team, status:'Completed', qty:1, hours:0, amount:cost, materials:S(r['Complaint No'])?('Complaint '+S(r['Complaint No'])):'', follow_up:'NO',
+      unit:S(r['House']), building:'', road:S(r['Road']), block:S(r['Block']), area:areaName, fault:type+' reinstatement', pack:'', price:cost, add_pack:'', add_price:0, dewatering:0, tanker:0, others:0});
+    n++;
+  });
+  return n;
+}
 function importFiles(files, kind){
   const list = Array.from(files); if(!list.length) return;
   let done=0, rows=0, newEmp=0; const errs=[];
   const before = qv('SELECT COUNT(*) FROM employees');
   const next = ()=>{
     if(done>=list.length){
-      mutate(()=>{}).then(async ()=>{ if(PENDING_SALARY.length){ for(const [c,s] of PENDING_SALARY){ await setSalary(c,s); } PENDING_SALARY=[]; } render(); const created = qv('SELECT COUNT(*) FROM employees')-before; toast(`${kind==='ts'?'Timesheet':kind==='emp'?'Employee list':kind==='boq'?'BOQ complaints':'Daily cost report'}: ${rows} rows imported from ${list.length} file${list.length===1?'':'s'}${created?` · ${created} new employees created — set their salary`:''}${errs.length?` · ${errs.length} failed`:''}`, errs.length?'warn':'good'); });
+      mutate(()=>{}).then(async ()=>{ if(PENDING_SALARY.length){ for(const [c,s] of PENDING_SALARY){ await setSalary(c,s); } PENDING_SALARY=[]; } render(); const created = qv('SELECT COUNT(*) FROM employees')-before; toast(`${kind==='ts'?'Timesheet':kind==='emp'?'Employee list':kind==='boq'?'BOQ complaints':kind==='reinst'?'Reinstatement jobs':'Daily cost report'}: ${rows} rows imported from ${list.length} file${list.length===1?'':'s'}${created?` · ${created} new employees created — set their salary`:''}${errs.length?` · ${errs.length} failed`:''}`, errs.length?'warn':'good'); });
       return;
     }
     const f = list[done++]; const reader = new FileReader();
@@ -3134,6 +3177,7 @@ function importFiles(files, kind){
               insertRow('work_log',{date, work_order:no, requested_by:S(r['Depot']), depot:S(r['Depot']), location:loc, category:natureOf(fault), description:fault||'Leak repair', team, status:'Completed', qty:1, hours:0, amount:N(r['Total Amount']), materials:S(r['Remarks']), follow_up:'NO',
                 unit:S(r['Unit']), building:S(r['Building']), road:S(r['Road']), block:S(g(r,'Block ','Block')), area:S(r['Area']), fault, pack:S(r['Pack']), price:N(r['Price']), add_pack:S(r['Multible']), add_price:N(r['Multible Amount']), dewatering:dew, tanker:tank, others}); rows++; });
           }
+          else if(kind==='reinst'){ rows += importReinstatement(wb); }
           else if(kind==='dcr'){ // MAINTENANCE Daily Cost Report: Work + Manpower + Assets sheets
             const work = rowsOf(wb,'Work','Work Category')||[]; const dates=new Set(work.map(r=>xlDate(r['Date'])).filter(Boolean));
             dates.forEach(d=> run('DELETE FROM work_log WHERE date=? AND work_order<>"" AND work_order IN (SELECT work_order FROM work_log WHERE date=?)',[d,d]));
@@ -3164,12 +3208,13 @@ function importCardsHtml(){
     <div class="import-card" data-kind="boq"><div class="ic-head">${ICONS.coins}<b>BOQ export</b></div><p>Complaints with their BOQ amounts → jobs and the day's work done. <span class="mono">BOQ-Engineer-….xlsx</span></p><button class="btn btn-primary" data-pick="boq">${ICONS.upload}Choose file(s)</button></div>
     <div class="import-card" data-kind="ts"><div class="ic-head">${ICONS.clipboard}<b>Attendance timesheet</b></div><p>Overtime hours and food allowance per person. <span class="mono">History_YYYY-MM-DD_DEPOT_-_BUDAIYA.xlsx</span></p><button class="btn btn-primary" data-pick="ts">${ICONS.upload}Choose file(s)</button></div>
     <div class="import-card" data-kind="emp"><div class="ic-head">${ICONS.users}<b>Employee list</b></div><p>Roster with teams and salaries. <span class="mono">Budaiya_Employee.xlsx</span></p><button class="btn" data-pick="emp">${ICONS.upload}Choose file</button></div>
+    <div class="import-card" data-kind="reinst"><div class="ic-head">${ICONS.tool}<b>Reinstatement cost report</b></div><p>Excavation reinstatements → jobs: Bricks / Concrete / Kerb → <b>Interlock</b> team, Asphalt → <b>Asphalt</b> team. <span class="mono">Reinstatement-Cost-Report-….xlsx</span></p><button class="btn btn-primary" data-pick="reinst">${ICONS.upload}Choose file(s)</button></div>
     <div class="import-card" data-kind="dcr"><div class="ic-head">${ICONS.report}<b>Old daily cost report</b></div><p>Loads a hand-made report's Work, Manpower and Assets sheets. <span class="mono">…Daily_Cost_Report….xlsx</span></p><button class="btn" data-pick="dcr">${ICONS.upload}Choose file(s)</button></div>
   </div>
   <div class="dropzone" id="dropzone">${ICONS.upload}<div>…or drag files here — the type is detected from the file name</div></div>
   <input type="file" id="imp-file" accept=".xlsx,.xlsm,.xls" multiple style="display:none">`;
 }
-function detectKind(name){ const n=name.toLowerCase(); if(/^boq/.test(n)) return 'boq'; if(/^history_/.test(n)) return 'ts'; if(/employee/.test(n)) return 'emp'; if(/cost_report|cost report/.test(n)) return 'dcr'; return null; }
+function detectKind(name){ const n=name.toLowerCase(); if(/reinstatement/.test(n)) return 'reinst'; if(/^boq/.test(n)) return 'boq'; if(/^history_/.test(n)) return 'ts'; if(/employee/.test(n)) return 'emp'; if(/cost_report|cost report/.test(n)) return 'dcr'; return null; }
 function wireImportCards(root){
   const inp = root.querySelector('#imp-file'); let kind=null;
   root.querySelectorAll('[data-pick]').forEach(b=> b.addEventListener('click', ()=>{ kind=b.dataset.pick; inp.multiple = kind!=='emp'; inp.click(); }));
@@ -3186,7 +3231,7 @@ function wireImportCards(root){
 function openImportModal(){
   document.getElementById('modal-root').innerHTML = `<div class="modal-overlay" id="modal-overlay"><div class="modal wide">
     <div class="modal-head"><h3>Upload files</h3><button class="btn btn-ghost btn-sm" id="modal-close">${ICONS.close}</button></div>
-    <div class="modal-body" style="display:block">${importCardsHtml()}<p class="hint" style="color:var(--dim);font-size:12.5px;margin:10px 0 0">Uploading the same day again simply updates it — nothing is duplicated.</p></div></div></div>`;
+    <div class="modal-body" style="display:block">${importCardsHtml()}<p class="hint" style="color:var(--dim);font-size:12.5px;margin:10px 0 0">Uploading the same day again simply updates it — nothing is duplicated. The reinstatement export is cumulative: upload the latest file each day and every excavation is refreshed by its number.</p></div></div></div>`;
   const close=()=>document.getElementById('modal-root').innerHTML='';
   document.getElementById('modal-close').addEventListener('click', close);
   document.getElementById('modal-overlay').addEventListener('click', e=>{ if(e.target.id==='modal-overlay') close(); });

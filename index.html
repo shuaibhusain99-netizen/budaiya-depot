@@ -2621,16 +2621,19 @@ function renderDashboard(){
   const trend = trendSeries('daily', today);
   const cd = DASH.date || today; const isToday = cd===today;
   const n = (sql,p)=>qv(sql,p)||0;
-  const boqN = n('SELECT COUNT(*) FROM work_log WHERE date=?',[cd]), boqAmt = n('SELECT SUM(amount) FROM work_log WHERE date=?',[cd]);
+  const boqN = n('SELECT COUNT(*) FROM work_log WHERE date=? AND category<>"Reinstatement"',[cd]), boqAmt = n('SELECT SUM(amount) FROM work_log WHERE date=? AND category<>"Reinstatement"',[cd]);
+  const rnN = n('SELECT COUNT(*) FROM work_log WHERE date=? AND category="Reinstatement"',[cd]), rnAmt = n('SELECT SUM(amount) FROM work_log WHERE date=? AND category="Reinstatement"',[cd]);
+  const rnTeams = q('SELECT team, COUNT(*) c FROM work_log WHERE date=? AND category="Reinstatement" GROUP BY team ORDER BY c DESC',[cd]).map(r=>`${r.team||'—'} ${r.c}`).join(' · ');
   const tsN = n('SELECT COUNT(*) FROM attendance WHERE date=?',[cd]);
   const mvN = n('SELECT (SELECT COUNT(*) FROM vehicle_moves WHERE date_out=?)+(SELECT COUNT(*) FROM equipment_moves WHERE date_out=?)',[cd,cd]);
   const openN = n('SELECT (SELECT COUNT(*) FROM vehicle_moves WHERE return_date IS NULL OR return_date="")+(SELECT COUNT(*) FROM equipment_moves WHERE return_date IS NULL OR return_date="")');
   const fuelN = n('SELECT COUNT(*) FROM expenses WHERE date=?',[cd]), fuelAmt = n('SELECT SUM(amount) FROM expenses WHERE date=?',[cd]);
   const stN = n('SELECT COUNT(*) FROM stock_moves WHERE date=?',[cd]);
   const step = (done, title, detail, btnLabel, action, extra)=>`<div class="step ${done?'done':''}"><div class="step-ico">${done?ICONS.check:'<span class="step-n"></span>'}</div><div class="step-body"><div class="step-title">${title}</div><div class="step-detail">${detail}</div></div>${btnLabel?`<button class="btn btn-sm ${done?'':'btn-primary'}" ${action}>${btnLabel}</button>`:''}${extra||''}</div>`;
-  const checklist = `<div class="panel checklist"><div class="panel-head"><h3>Checklist for <input type="date" class="inp" id="dash-date" value="${cd}" style="height:30px;padding:2px 8px;font-size:13px"> ${isToday?'<span class="tag">today</span>':''}</h3><span class="tag">${[boqN>0,tsN>0,mvN>0||openN>0,stN>0,fuelN>0].filter(Boolean).length} of 5 done</span></div><div class="panel-body steps">
-    ${step(boqN>0, 'BOQ jobs', boqN? `${boqN} jobs · work done ${money(boqAmt)} ${CURRENCY}` : 'No jobs for this date yet — upload the BOQ export', 'Upload BOQ', 'data-upload="1"')}
-    ${step(tsN>0, 'Attendance', tsN? `${tsN} people on the timesheet · ${n('SELECT COUNT(*) FROM attendance WHERE date=? AND status="Working"',[cd])} working` : 'No timesheet for this date yet', 'Upload timesheet', 'data-upload="1"')}
+  const checklist = `<div class="panel checklist"><div class="panel-head"><h3>Checklist for <input type="date" class="inp" id="dash-date" value="${cd}" style="height:30px;padding:2px 8px;font-size:13px"> ${isToday?'<span class="tag">today</span>':''}</h3><span class="tag">${[boqN>0,rnN>0,tsN>0,mvN>0||openN>0,stN>0,fuelN>0].filter(Boolean).length} of 6 done</span></div><div class="panel-body steps">
+    ${step(boqN>0, 'BOQ jobs', boqN? `${boqN} jobs · work done ${money(boqAmt)} ${CURRENCY}` : 'No jobs for this date yet — upload the BOQ export', 'Upload BOQ', 'data-upload="boq"')}
+    ${step(rnN>0, 'Reinstatement jobs', rnN? `${rnN} jobs · work done ${money(rnAmt)} ${CURRENCY} · ${rnTeams}` : 'No reinstatement jobs for this date yet — upload the Reinstatement Cost Report', 'Upload reinstatement', 'data-upload="reinst"')}
+    ${step(tsN>0, 'Attendance', tsN? `${tsN} people on the timesheet · ${n('SELECT COUNT(*) FROM attendance WHERE date=? AND status="Working"',[cd])} working` : 'No timesheet for this date yet', 'Upload timesheet', 'data-upload="ts"')}
     ${step(mvN>0||openN>0, 'Vehicle & equipment movements', `${mvN} check-outs on this date · ${openN} out now`, 'Check out', 'data-form="vehicle_moves"')}
     ${step(fuelN>0, 'Fuel & expenses', fuelN? `${fuelN} entries · ${money(fuelAmt)} ${CURRENCY}` : 'Nothing logged for this date', 'Log fuel', `data-form="expenses" data-preset='{"category":"Fuel","date":"${cd}"}'`)}
     ${step(stN>0, 'Stock issued / received', stN? `${stN} movements` : 'No stock movements on this date', 'Issue stock', `data-form="stock_moves" data-preset='{"type":"Out","date":"${cd}"}'`)}
@@ -2664,7 +2667,7 @@ function renderDashboard(){
   document.querySelectorAll('[data-form]').forEach(b=> b.addEventListener('click', ()=> openForm(b.dataset.form, null, b.dataset.preset?JSON.parse(b.dataset.preset):null)));
   const dr=document.getElementById('dash-rpt'); if(dr) dr.addEventListener('click', ()=> downloadDailyCostReport(cd));
   document.getElementById('dash-date').addEventListener('change', e=>{ DASH.date=e.target.value||today; renderDashboard(); });
-  document.querySelectorAll('[data-upload]').forEach(b=> b.addEventListener('click', openImportModal));
+  document.querySelectorAll('[data-upload]').forEach(b=> b.addEventListener('click', ()=> openImportModal(b.dataset.upload)));
   document.getElementById('dash-m').addEventListener('change', e=>{ DASH.month=e.target.value; renderDashboard(); });
   document.getElementById('dash-y').addEventListener('change', e=>{ DASH.year=e.target.value; renderDashboard(); });
 }
@@ -3228,7 +3231,7 @@ function wireImportCards(root){
     Object.entries(groups).forEach(([k,fs])=> importFiles(fs,k));
   });
 }
-function openImportModal(){
+function openImportModal(kind){
   document.getElementById('modal-root').innerHTML = `<div class="modal-overlay" id="modal-overlay"><div class="modal wide">
     <div class="modal-head"><h3>Upload files</h3><button class="btn btn-ghost btn-sm" id="modal-close">${ICONS.close}</button></div>
     <div class="modal-body" style="display:block">${importCardsHtml()}<p class="hint" style="color:var(--dim);font-size:12.5px;margin:10px 0 0">Uploading the same day again simply updates it — nothing is duplicated. The reinstatement export is cumulative: upload the latest file each day and every excavation is refreshed by its number.</p></div></div></div>`;
@@ -3236,6 +3239,7 @@ function openImportModal(){
   document.getElementById('modal-close').addEventListener('click', close);
   document.getElementById('modal-overlay').addEventListener('click', e=>{ if(e.target.id==='modal-overlay') close(); });
   wireImportCards(document.getElementById('modal-root'));
+  if(kind && kind!=='1'){ const b=document.querySelector(`#modal-root [data-pick="${kind}"]`); if(b){ b.closest('.import-card').style.outline='2px solid var(--amber)'; b.click(); } }
 }
 
 /* ===================================================================== data & files page */

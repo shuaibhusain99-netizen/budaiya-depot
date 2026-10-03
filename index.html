@@ -784,7 +784,7 @@ function migrate(){
   run("UPDATE equipment SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
   run("UPDATE employees SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
   // v13: BOQ exports label tanker jobs "B Tanker" (Budaiya) — map them to the Tanker team unless the engineer already decided otherwise
-  { let al=String(getSetting('team_aliases','')); ['B Tanker','I Tanker'].forEach(n=>{ if(!new RegExp('^\\s*'+n+'\\s*=','im').test(al)) al=(al?al.replace(/\s+$/,'')+'\n':'')+n+' = Tanker'; }); setSettingRaw('team_aliases', al); }
+  { const tk=getSetting('tanker_team','Tanker'); const lines=String(getSetting('team_aliases','')).split(/\n/).filter(l=>l.trim() && !/^\s*[bi]\s*tanker\s*=/i.test(l)); lines.push('B Tanker = '+tk, 'I Tanker = '+tk); setSettingRaw('team_aliases', lines.join('\n')); }
   // v13: reinstatement tracking — payment stage, completion date (from the KPI export), material cost & quantities
   [['stage','TEXT'],['done_date','TEXT'],['mat_cost','REAL DEFAULT 0'],['reinst_q','TEXT']].forEach(([c,t])=>{ if(!hasColumn('work_log',c)) run(`ALTER TABLE work_log ADD COLUMN ${c} ${t}`); });
   run("CREATE TABLE IF NOT EXISTS reinst_done(exc TEXT PRIMARY KEY, complaint TEXT, type TEXT, start_at TEXT, end_at TEXT, within72 TEXT)");
@@ -1227,7 +1227,7 @@ function assetClassOf(type, a){
 function teamAliasMap(){ const m={}; String(getSetting('team_aliases','')).split(/\n/).forEach(l=>{ const i=l.indexOf('='); if(i>0){ const a=l.slice(0,i).trim().toLowerCase(), b=l.slice(i+1).trim(); if(a&&b) m[a]=b; } }); return m; }
 function normalizeTeam(name){
   let n = String(name||'').trim(); if(!n) return '';
-  const m = teamAliasMap(); if(m[n.toLowerCase()]) n = m[n.toLowerCase()];
+  const m = teamAliasMap(); if(m[n.toLowerCase()]) n = m[n.toLowerCase()]; if(/^[bi]\s*[-_]?\s*tanker$/i.test(n)) n = getSetting('tanker_team','Tanker');
   const known = q('SELECT DISTINCT team FROM employees WHERE team<>"" ORDER BY team').map(r=>r.team).concat(teamNames());
   const hit = known.find(t=>t.toLowerCase()===n.toLowerCase()); if(hit) return hit;
   // BOQ exports often carry a person's first name instead of the team — use that employee's team when exactly one team matches
@@ -1236,7 +1236,7 @@ function normalizeTeam(name){
   return n;
 }
 /* one spelling per team, employees' spelling wins, then case-insensitive merge */
-function makeCanon(){ const al=teamAliasMap(), c={}; const alias=t=>{ let n=String(t||'').trim(); for(let i=0;i<3 && al[n.toLowerCase()];i++) n=al[n.toLowerCase()]; return n; };
+function makeCanon(){ const al=teamAliasMap(), c={}, tk=getSetting('tanker_team','Tanker'); const alias=t=>{ let n=String(t||'').trim(); for(let i=0;i<3 && al[n.toLowerCase()];i++) n=al[n.toLowerCase()]; if(/^[bi]\s*[-_]?\s*tanker$/i.test(n)) n=tk; return n; };
   q('SELECT DISTINCT team FROM employees WHERE team<>""').forEach(r=>{ const n=alias(r.team), k=n.toLowerCase(); c[k]=c[k]||n; });
   return t=>{ const n=alias(t), k=n.toLowerCase(); if(!k) return ''; if(!c[k]) c[k]=n; return c[k]; }; }
 
@@ -1321,6 +1321,41 @@ async function buildDailyCostReport(date){
     const r=wsA.getRow(rn); r.values=[F('ROW()-4',i+1), a.cls, site.replace('DEPOT - ','')+' Depot', a.desc, a.no, a.team, a.avail?'Yes':'No', a.rateHr, a.hours, F(`IF($G${rn}="Yes",$H${rn}*I${rn},0)`,charged), a.used?'Yes':'No', hrsUsed, F(`IF($J${rn}=0,0,IFERROR($L${rn}/$I${rn},0))`,util), F(`$J${rn}*(1-$M${rn})`,idle), a.fuel||0, F(`$J${rn}+$O${rn}`,charged+a.fuel)];
     [8,10,14,15,16].forEach(c=>r.getCell(c).numFmt=RPT.money); [9,12].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(13).numFmt=RPT.pct; zebra(r,1,16,i); });
   const at=wsA.getRow(aTot); at.getCell(4).value='TOTAL'; at.getCell(10).value=F(`SUM(J${aFirst}:J${aLast})`,hireTot); at.getCell(12).value=F(`SUM(L${aFirst}:L${aLast})`,0); at.getCell(13).value=F(`IFERROR(SUMIFS(L${aFirst}:L${aLast},G${aFirst}:G${aLast},"Yes")/SUMIFS(I${aFirst}:I${aLast},G${aFirst}:G${aLast},"Yes"),0)`,0); at.getCell(14).value=F(`SUM(N${aFirst}:N${aLast})`,idleTot); at.getCell(15).value=F(`SUM(O${aFirst}:O${aLast})`,fuelTot); at.getCell(16).value=F(`SUM(P${aFirst}:P${aLast})`,hireTot+fuelTot); [10,14,15,16].forEach(c=>at.getCell(c).numFmt=RPT.money); at.getCell(13).numFmt=RPT.pct; totalRow(at,1,16);
+
+  /* ---------- Reinstatement ---------- */
+  { const wsR = wb.addWorksheet('Reinstatement', {views:[{state:'frozen', ySplit:4}]});
+    wsR.getCell('B2').value='REINSTATEMENT WORK DONE'; wsR.getCell('B2').font={bold:true,size:14};
+    wsR.getCell('B3').value=`${site} · ${excelDate(date).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric',timeZone:'UTC'})} — Interlock & concrete → Interlock team · Asphalt → Asphalt team`; wsR.getCell('B3').font={italic:true,size:9,color:{argb:'FF666666'}};
+    const rj = work.filter(w=>w.category==='Reinstatement').map(w=>{ let qy={}; try{ qy=JSON.parse(w.reinst_q||'{}')||{}; }catch(e){} return {...w, qy}; });
+    const RM = matRates();
+    wsR.getRow(4).values=['S/N','Excavation No.','Complaint','Type','Team','Location','Area (m²)','60mm Yellow (pcs)','60mm Other (pcs)','80mm Yellow (pcs)','80mm Other (pcs)','New Kerbs (pcs)','Old Kerbs (pcs)','Concrete (m³)','Asphalt (m³)','Road Base (m³)','Work Done (BD)','Material Cost (BD)','Net (BD)','Margin %','Status','Completed On','','Unit cost','BD'];
+    styleHeader(wsR.getRow(4),1,22); wsR.getRow(4).height=32; styleHeader(wsR.getRow(4),24,25);
+    [5,14,13,11,12,34,9,9,9,9,9,8,8,9,9,9,13,13,13,9,16,12,3,26,10].forEach((w,i)=>wsR.getColumn(i+1).width=w);
+    // unit-cost block (X5:Y12) — the material formulas point here so the engineer can test other prices
+    const rateRows=[['60mm Yellow brick (per piece)','b60_yellow'],['60mm Other colour brick (per piece)','b60_other'],['80mm Yellow brick (per piece)','b80_yellow'],['80mm Other colour brick (per piece)','b80_other'],['Kerb stone (per piece)','kerb'],['Concrete (per m³)','concrete'],['Asphalt (per m³)','asphalt'],['Road base (per m³)','roadbase']];
+    rateRows.forEach(([l,k],i)=>{ const r=wsR.getRow(5+i); r.getCell(24).value=l; r.getCell(25).value=Number(RM[k])||0; r.getCell(25).numFmt=RPT.money; zebra(r,24,25,i); });
+    const rFirst=5, rLast=rFirst+Math.max(rj.length,1)-1, rTot=rLast+1;
+    const rate=k=>`$Y$${5+rateRows.findIndex(x=>x[1]===k)}`;
+    rj.forEach((w,i)=>{ const rn=rFirst+i, Q=w.qy, mat=Number(w.mat_cost||0), amt=Number(w.amount||0);
+      const matF=`H${rn}*${rate('b60_yellow')}+I${rn}*${rate('b60_other')}+J${rn}*${rate('b80_yellow')}+K${rn}*${rate('b80_other')}+(L${rn}+M${rn})*${rate('kerb')}+N${rn}*${rate('concrete')}+O${rn}*${rate('asphalt')}+P${rn}*${rate('roadbase')}`;
+      const r=wsR.getRow(rn); r.values=[F('ROW()-4',i+1), w.work_order||'', String(w.materials||'').replace(/^Complaint\s*/i,''), Q.type||String(w.fault||'').replace(/ reinstatement$/i,''), w.team||'', w.location||'', Number(Q.area||0), Number(Q.y60||0), Number(Q.o60||0), Number(Q.y80||0), Number(Q.o80||0), Number(Q.kerbNew||0), Number(Q.kerbOld||0), Number(Q.conc_m3||0), Number(Q.asph_m3||0), Number(Q.rb_m3||0), amt, F(matF,mat), F(`Q${rn}-R${rn}`,amt-mat), F(`IFERROR(S${rn}/Q${rn},"")`,amt?(amt-mat)/amt:''), w.stage||(w.status==='Completed'?'Completed':''), w.done_date?excelDate(w.done_date):''];
+      [7,14,15,16].forEach(c=>r.getCell(c).numFmt='#,##0.00'); [17,18,19].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(20).numFmt=RPT.pct; r.getCell(22).numFmt=RPT.date; zebra(r,1,22,i); });
+    if(!rj.length){ const r=wsR.getRow(rFirst); r.getCell(1).value=1; r.getCell(2).value='No reinstatement work on this date'; [17,18,19].forEach(c=>r.getCell(c).value=0); zebra(r,1,22,0); }
+    const rt=wsR.getRow(rTot); rt.getCell(1).value='TOTAL'; const sumCols={7:'area',8:'y60',9:'o60',10:'y80',11:'o80',12:'kerbNew',13:'kerbOld',14:'conc_m3',15:'asph_m3',16:'rb_m3'};
+    Object.entries(sumCols).forEach(([c,k])=>{ const L=String.fromCharCode(64+Number(c)); rt.getCell(Number(c)).value=F(`SUM(${L}${rFirst}:${L}${rLast})`, rj.reduce((s,w)=>s+Number(w.qy[k]||0),0)); rt.getCell(Number(c)).numFmt='#,##0.00'; });
+    const rAmt=rj.reduce((s,w)=>s+Number(w.amount||0),0), rMat=rj.reduce((s,w)=>s+Number(w.mat_cost||0),0);
+    rt.getCell(17).value=F(`SUM(Q${rFirst}:Q${rLast})`,rAmt); rt.getCell(18).value=F(`SUM(R${rFirst}:R${rLast})`,rMat); rt.getCell(19).value=F(`Q${rTot}-R${rTot}`,rAmt-rMat); rt.getCell(20).value=F(`IFERROR(S${rTot}/Q${rTot},"")`,rAmt?(rAmt-rMat)/rAmt:''); [17,18,19].forEach(c=>rt.getCell(c).numFmt=RPT.money); rt.getCell(20).numFmt=RPT.pct; totalRow(rt,1,22);
+    // by team
+    let bn=rTot+3; band(wsR,`B${bn}:I${bn}`,'REINSTATEMENT BY TEAM'); bn++;
+    wsR.getRow(bn).values=['','Team','Jobs','Work Done (BD)','Material Cost (BD)','Net (BD)','Margin %','Completed','Waiting Payment']; styleHeader(wsR.getRow(bn),2,9); bn++;
+    const rTeams=[...new Set(rj.map(w=>w.team).filter(Boolean))]; if(!rTeams.length) rTeams.push(canon('Interlock'), canon('Asphalt'));
+    const bFirst=bn;
+    rTeams.forEach((t,i)=>{ const jobs=rj.filter(w=>w.team===t), a=jobs.reduce((s,w)=>s+Number(w.amount||0),0), m=jobs.reduce((s,w)=>s+Number(w.mat_cost||0),0);
+      const r=wsR.getRow(bn); r.values=['',t, F(`COUNTIF($E$${rFirst}:$E$${rLast},B${bn})`,jobs.length), F(`SUMIF($E$${rFirst}:$E$${rLast},B${bn},$Q$${rFirst}:$Q$${rLast})`,a), F(`SUMIF($E$${rFirst}:$E$${rLast},B${bn},$R$${rFirst}:$R$${rLast})`,m), F(`D${bn}-E${bn}`,a-m), F(`IFERROR(F${bn}/D${bn},"")`,a?(a-m)/a:''), F(`COUNTIFS($E$${rFirst}:$E$${rLast},B${bn},$U$${rFirst}:$U$${rLast},"Completed")`,jobs.filter(w=>/^completed$/i.test(w.stage||'')).length), F(`COUNTIFS($E$${rFirst}:$E$${rLast},B${bn},$U$${rFirst}:$U$${rLast},"Waiting Payment")`,jobs.filter(w=>/waiting/i.test(w.stage||'')).length)];
+      [4,5,6].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(7).numFmt=RPT.pct; zebra(r,2,9,i); bn++; });
+    { const r=wsR.getRow(bn); r.values=['','TOTAL', F(`SUM(C${bFirst}:C${bn-1})`,rj.length), F(`SUM(D${bFirst}:D${bn-1})`,rAmt), F(`SUM(E${bFirst}:E${bn-1})`,rMat), F(`D${bn}-E${bn}`,rAmt-rMat), F(`IFERROR(F${bn}/D${bn},"")`,rAmt?(rAmt-rMat)/rAmt:''), F(`SUM(H${bFirst}:H${bn-1})`,rj.filter(w=>/^completed$/i.test(w.stage||'')).length), F(`SUM(I${bFirst}:I${bn-1})`,rj.filter(w=>/waiting/i.test(w.stage||'')).length)]; [4,5,6].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(7).numFmt=RPT.pct; totalRow(r,2,9); }
+    wsR.autoFilter={from:{row:4,column:1},to:{row:4,column:22}};
+  }
 
   /* ---------- Lists ---------- */
   const wsL = wb.addWorksheet('Lists');

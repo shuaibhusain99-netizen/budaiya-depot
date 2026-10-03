@@ -637,7 +637,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
      again so the screen never shows a stale copy.
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -783,6 +783,10 @@ function migrate(){
   run("UPDATE vehicles SET project=CASE WHEN lower(COALESCE(site,'')) LIKE '%isa town%' THEN 'Isa Town Depot' ELSE 'Budaiya Depot' END WHERE project IS NULL OR project=''");
   run("UPDATE equipment SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
   run("UPDATE employees SET project='Budaiya Depot' WHERE project IS NULL OR project=''");
+  // v13: reinstatement tracking — payment stage, completion date (from the KPI export), material cost & quantities
+  [['stage','TEXT'],['done_date','TEXT'],['mat_cost','REAL DEFAULT 0'],['reinst_q','TEXT']].forEach(([c,t])=>{ if(!hasColumn('work_log',c)) run(`ALTER TABLE work_log ADD COLUMN ${c} ${t}`); });
+  run("CREATE TABLE IF NOT EXISTS reinst_done(exc TEXT PRIMARY KEY, complaint TEXT, type TEXT, start_at TEXT, end_at TEXT, within72 TEXT)");
+  if(qv('SELECT COUNT(*) FROM settings WHERE key=?',['reinst_mat_rates'])===0) setSettingRaw('reinst_mat_rates', JSON.stringify(REINST_MAT_DEFAULT));
   // v11: richer maintenance records
   [['maint_type','TEXT'],['workshop','TEXT'],['meter','REAL'],['work_done','TEXT'],['parts','TEXT'],['cost_parts','REAL DEFAULT 0'],['cost_labour','REAL DEFAULT 0'],['invoice_no','TEXT'],['next_due','TEXT'],['next_due_meter','REAL'],['note','TEXT']].forEach(([c,t])=>{ if(!hasColumn('maintenance',c)) run(`ALTER TABLE maintenance ADD COLUMN ${c} ${t}`); });
   // v10: movements carry team + project; expenses carry project; utilisation has its own switch
@@ -1266,20 +1270,22 @@ async function buildDailyCostReport(date){
   /* ---------- Work-1 ---------- */
   const wsW = wb.addWorksheet('Work-1', {views:[{state:'frozen', ySplit:4}]});
   wsW.getCell('B2').value='DAILY WORK LOG'; wsW.getCell('B2').font={bold:true,size:14};
-  const wHead=['S.NO.','Date','Depot','Team','Complaint Nature ','Job Status','Complaint Number ','Unit','Building','Road','Block','Area','Fault ','QTY','Pack ','Price (BD)','Additional Pack ','Additional Price (BD)','Dewatering  (BD)','Tanker  (BD)','Lean Mix  (BD)','Others  (BD)','Total (BD)','Total Work Done (BD)','Detail ','Follow-up Required'];
-  wsW.getRow(4).values = wHead; styleHeader(wsW.getRow(4),1,26); wsW.getRow(4).height=32;
-  [9,33,13,14.4,23.7,26,19.7,4.9,7.7,7,13,11.7,19.9,6,7,9.7,14.9,11.3,11.3,11.3,11.3,11.3,11,14,42,10].forEach((w,i)=>wsW.getColumn(i+1).width=w);
+  const wHead=['S.NO.','Date','Depot','Team','Complaint Nature ','Job Status','Complaint Number ','Unit','Building','Road','Block','Area','Fault ','QTY','Pack ','Price (BD)','Additional Pack ','Additional Price (BD)','Dewatering  (BD)','Tanker  (BD)','Lean Mix  (BD)','Others  (BD)','Total (BD)','Total Work Done (BD)','Detail ','Follow-up Required','Material Cost (BD)'];
+  wsW.getRow(4).values = wHead; styleHeader(wsW.getRow(4),1,27); wsW.getRow(4).height=32;
+  [9,33,13,14.4,23.7,26,19.7,4.9,7.7,7,13,11.7,19.9,6,7,9.7,14.9,11.3,11.3,11.3,11.3,11.3,11,14,42,10,12].forEach((w,i)=>wsW.getColumn(i+1).width=w);
   const wN = Math.max(work.length, 1), wFirst=5, wLast=wFirst+wN-1, wTot=wLast+1;
   const nLists = FAULT_PRICES.length+4;
   work.forEach((w,i)=>{
     const r = wsW.getRow(wFirst+i); const rn=wFirst+i;
     const total = Number(w.add_price||0)+Number(w.dewatering||0)+Number(w.tanker||0)+Number(w.others||0);
-    r.values=[F(`ROW()-4`,i+1), excelDate(w.date), w.depot||w.requested_by||'BUDAIYA', w.team||'', w.category||natureOf(w.fault), w.status==='Completed'?'Resolved':(w.status||'Resolved'), w.work_order||'', w.unit||'', w.building||'', w.road||'', w.block||'', w.area||'', w.fault||w.description||'', Number(w.qty||1), w.pack||'', Number(w.price||0), w.add_pack||'', Number(w.add_price||0), Number(w.dewatering||0), Number(w.tanker||0), 0, Number(w.others||0), F(`SUM(R${rn}:V${rn})`,total), F(`IFERROR(SUM(P${rn},W${rn}),0)`, Number(w.price||0)+total), w.materials||'', (w.follow_up||'NO').toUpperCase()==='YES'?'Yes':'No'];
-    r.getCell(2).numFmt=RPT.date; [16,18,19,20,21,22,23,24].forEach(c=>r.getCell(c).numFmt=RPT.money); zebra(r,1,26,i);
+    r.values=[F(`ROW()-4`,i+1), excelDate(w.date), w.depot||w.requested_by||'BUDAIYA', w.team||'', w.category||natureOf(w.fault), w.status==='Completed'?'Resolved':(w.status||'Resolved'), w.work_order||'', w.unit||'', w.building||'', w.road||'', w.block||'', w.area||'', w.fault||w.description||'', Number(w.qty||1), w.pack||'', Number(w.price||0), w.add_pack||'', Number(w.add_price||0), Number(w.dewatering||0), Number(w.tanker||0), 0, Number(w.others||0), F(`SUM(R${rn}:V${rn})`,total), F(`IFERROR(SUM(P${rn},W${rn}),0)`, Number(w.price||0)+total), w.materials||'', (w.follow_up||'NO').toUpperCase()==='YES'?'Yes':'No', Number(w.mat_cost||0)];
+    r.getCell(27).numFmt=RPT.money;
+    r.getCell(2).numFmt=RPT.date; [16,18,19,20,21,22,23,24].forEach(c=>r.getCell(c).numFmt=RPT.money); zebra(r,1,27,i);
   });
-  if(!work.length){ const r=wsW.getRow(wFirst); r.getCell(1).value=1; r.getCell(24).value=0; zebra(r,1,26,0); }
-  const rt=wsW.getRow(wTot); rt.getCell(1).value='TOTAL'; for(let c=16;c<=24;c++){ const L=String.fromCharCode(64+c); rt.getCell(c).value=F(`SUM(${L}${wFirst}:${L}${wLast})`, work.reduce((s,w)=>s+Number({16:'price',18:'add_price',19:'dewatering',20:'tanker',22:'others'}[c]?w[{16:'price',18:'add_price',19:'dewatering',20:'tanker',22:'others'}[c]]||0:(c===23?Number(w.add_price||0)+Number(w.dewatering||0)+Number(w.tanker||0)+Number(w.others||0):c===24?Number(w.amount||0):0)),0)); rt.getCell(c).numFmt=RPT.money; } totalRow(rt,1,26);
+  if(!work.length){ const r=wsW.getRow(wFirst); r.getCell(1).value=1; r.getCell(24).value=0; r.getCell(27).value=0; zebra(r,1,27,0); }
+  const rt=wsW.getRow(wTot); rt.getCell(1).value='TOTAL'; for(let c=16;c<=24;c++){ const L=String.fromCharCode(64+c); rt.getCell(c).value=F(`SUM(${L}${wFirst}:${L}${wLast})`, work.reduce((s,w)=>s+Number({16:'price',18:'add_price',19:'dewatering',20:'tanker',22:'others'}[c]?w[{16:'price',18:'add_price',19:'dewatering',20:'tanker',22:'others'}[c]]||0:(c===23?Number(w.add_price||0)+Number(w.dewatering||0)+Number(w.tanker||0)+Number(w.others||0):c===24?Number(w.amount||0):0)),0)); rt.getCell(c).numFmt=RPT.money; } rt.getCell(27).value=F(`SUM(AA${wFirst}:AA${wLast})`, work.reduce((s,w)=>s+Number(w.mat_cost||0),0)); rt.getCell(27).numFmt=RPT.money; totalRow(rt,1,27);
   const workDone = work.reduce((s,w)=>s+Number(w.amount||0),0);
+  const matTot = work.reduce((s,w)=>s+Number(w.mat_cost||0),0);
 
   /* ---------- Manpower ---------- */
   const wsM = wb.addWorksheet('Manpower', {views:[{state:'frozen', ySplit:4}]});
@@ -1330,7 +1336,7 @@ async function buildDailyCostReport(date){
   ws.mergeCells('H5:I5'); ws.getCell('H5').value=F(`SUMPRODUCT(('Work-1'!$D$${wFirst}:$D$${wLast}<>"")/COUNTIF('Work-1'!$D$${wFirst}:$D$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast}&""))`, new Set(work.map(w=>w.team).filter(Boolean)).size); ws.getCell('H5').font={bold:true}; ws.getCell('H5').numFmt=RPT.int;
   ws.mergeCells('J5:K5'); ws.getCell('J5').value=F(`COUNTIFS(Manpower!$G$${mFirst}:$G$${mLast},"Working")`, staffOnSite); ws.getCell('J5').font={bold:true}; ws.getCell('J5').numFmt=RPT.int;
   const kpi=(ref1,ref2,label,val,fmt)=>{ ws.mergeCells(ref1); ws.mergeCells(ref2); const a=ws.getCell(ref1.split(':')[0]), b=ws.getCell(ref2.split(':')[0]); a.value=label; a.font={bold:true,size:9,color:{argb:'FF5A6F7B'}}; b.value=val; b.font={bold:true,size:13}; b.numFmt=fmt; [ref1,ref2].forEach(r=>{ const [s,e]=r.split(':'); for(let c=ws.getCell(s).col;c<=ws.getCell(e).col;c++) ws.getCell(ws.getCell(s).row,c).fill={type:'pattern',pattern:'solid',fgColor:{argb:RPT.zebra}}; }); };
-  const totalCost = manpowerTot+hireTot+fuelTot, net = workDone-totalCost, margin = workDone? net/workDone : 0, jobsDone = work.filter(w=>w.status==='Completed').length;
+  const totalCost = manpowerTot+hireTot+fuelTot+matTot, net = workDone-totalCost, margin = workDone? net/workDone : 0, jobsDone = work.filter(w=>w.status==='Completed').length;
   kpi('B7:C7','B8:C8','WORK DONE', F(`'Work-1'!X${wTot}`,workDone), RPT.moneyBD);
   kpi('D7:E7','D8:E8','TOTAL TEAM COST', F('I17',totalCost), RPT.moneyBD);
   kpi('F7:G7','F8:G8','NET PROFIT', F('I18',net), RPT.moneyBD);
@@ -1347,7 +1353,7 @@ async function buildDailyCostReport(date){
   { const r=ws.getRow(20); const listed=work.filter(w=>RPT_CATEGORIES.includes(w.category)); const oj=work.length-listed.length, oq=work.reduce((s,w)=>s+Number(w.qty||1),0)-listed.reduce((s,w)=>s+Number(w.qty||1),0), oa=workDone-listed.reduce((s,w)=>s+Number(w.amount||0),0);
     r.getCell(2).value='Other / not listed above'; r.getCell(3).value=F(`COUNTA('Work-1'!$G$${wFirst}:$G$${wLast})-SUM(C14:C19)`,oj); r.getCell(4).value=F(`SUM('Work-1'!$N$${wFirst}:$N$${wLast})-SUM(D14:D19)`,oq); r.getCell(5).value=F(`'Work-1'!$X$${wTot}-SUM(E14:E19)`,oa); r.getCell(6).value=F('IFERROR(E20/$E$21,0)',workDone?oa/workDone:0); r.getCell(3).numFmt=RPT.int; r.getCell(4).numFmt=RPT.int; r.getCell(5).numFmt=RPT.money; r.getCell(6).numFmt=RPT.pct; zebra(r,2,6,0); }
   { const r=ws.getRow(21); r.getCell(2).value='TOTAL'; r.getCell(3).value=F('SUM(C14:C20)',work.length); r.getCell(4).value=F('SUM(D14:D20)',work.reduce((s,w)=>s+Number(w.qty||1),0)); r.getCell(5).value=F('SUM(E14:E20)',workDone); r.getCell(6).value=F('IFERROR(E21/E21,0)',workDone?1:0); r.getCell(3).numFmt=RPT.int; r.getCell(4).numFmt=RPT.int; r.getCell(5).numFmt=RPT.money; r.getCell(6).numFmt=RPT.pct; totalRow(r,2,6); }
-  const cb=[['Manpower',F(`Manpower!M${mTot}`,manpowerTot)],['Asset Hire',F(`Assets!J${aTot}`,hireTot)],['Fuel',F(`Assets!O${aTot}`,fuelTot)]];
+  const cb=[['Manpower',F(`Manpower!M${mTot}`,manpowerTot)],['Asset Hire',F(`Assets!J${aTot}`,hireTot)],[matTot?'Fuel & Materials':'Fuel',F(`Assets!O${aTot}+'Work-1'!AA${wTot}`,fuelTot+matTot)]];
   cb.forEach((c,i)=>{ const rn=14+i; const r=ws.getRow(rn); r.getCell(8).value=c[0]; r.getCell(9).value=c[1]; r.getCell(10).value=F(`IFERROR(I${rn}/$E$21,"")`, workDone? c[1].result/workDone : ''); r.getCell(9).numFmt=RPT.money; r.getCell(10).numFmt=RPT.pct; zebra(r,8,10,i); });
   { const r=ws.getRow(17); r.getCell(8).value='TOTAL TEAM COST'; r.getCell(9).value=F('SUM(I14:I16)',totalCost); r.getCell(10).value=F('IFERROR(I17/$E$21,"")',workDone?totalCost/workDone:''); r.getCell(9).numFmt=RPT.money; r.getCell(10).numFmt=RPT.pct; totalRow(r,8,10); }
   { const r=ws.getRow(18); r.getCell(8).value='NET PROFIT'; r.getCell(9).value=F(`'Work-1'!X${wTot}-I17`,net); r.getCell(10).value=F('IFERROR(I18/$E$21,"")',workDone?net/workDone:''); r.getCell(9).numFmt=RPT.money; r.getCell(10).numFmt=RPT.pct; totalRow(r,8,10); }
@@ -1355,17 +1361,17 @@ async function buildDailyCostReport(date){
   { const r=ws.getRow(20); r.getCell(8).value='Idle Hire (unused)'; r.getCell(9).value=F(`Assets!N${aTot}`,idleTot); r.getCell(10).value=F('IFERROR(I20/$E$21,"")',workDone?idleTot/workDone:''); r.getCell(9).numFmt=RPT.money; r.getCell(9).font={bold:true}; r.getCell(10).numFmt=RPT.pct; zebra(r,8,10,0); }
 
   band(ws,'B24:I24','TEAM PERFORMANCE');
-  ws.getRow(25).values=['','Team','Jobs','Work Done (BD)','Manpower Cost (BD)','Asset Cost (BD)','Total Cost (BD)','Net (BD)','Margin %']; styleHeader(ws.getRow(25),2,9);
+  ws.getRow(25).values=['','Team','Jobs','Work Done (BD)','Manpower Cost (BD)',matTot?'Asset & Material Cost (BD)':'Asset Cost (BD)','Total Cost (BD)','Net (BD)','Margin %']; styleHeader(ws.getRow(25),2,9);
   let rn=26; const tFirst=rn;
-  const teamStats = t=>{ const jobs=work.filter(w=>w.team===t); const wd=jobs.reduce((s,w)=>s+Number(w.amount||0),0); const mp=emps.filter(e=>e.team===t).reduce((s,e)=>{ const a=att[e.card_no]; if(!a||a.status!=='Working') return s; const d=salaryOf(e.card_no)/dpm; const dm=(a.type_day&&a.type_day!=='Normal')?hmult:mult; return s+d+d/hpd*dm*Number(a.ot_hours||0)+Number(a.food||0)*foodRate; },0); const as=assets.filter(a=>a.team===t).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0); return {jobs:jobs.length, wd, mp, as}; };
+  const teamStats = t=>{ const jobs=work.filter(w=>w.team===t); const wd=jobs.reduce((s,w)=>s+Number(w.amount||0),0); const mp=emps.filter(e=>e.team===t).reduce((s,e)=>{ const a=att[e.card_no]; if(!a||a.status!=='Working') return s; const d=salaryOf(e.card_no)/dpm; const dm=(a.type_day&&a.type_day!=='Normal')?hmult:mult; return s+d+d/hpd*dm*Number(a.ot_hours||0)+Number(a.food||0)*foodRate; },0); const as=assets.filter(a=>a.team===t).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0) + jobs.reduce((s,w)=>s+Number(w.mat_cost||0),0); return {jobs:jobs.length, wd, mp, as}; };
   teams.forEach((t,i)=>{ const r=ws.getRow(rn); const s=teamStats(t);
-    r.values=['',t, F(`COUNTIFS('Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.jobs), F(`SUMIFS('Work-1'!$X$${wFirst}:$X$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.wd), F(`SUMIFS(Manpower!$M$${mFirst}:$M$${mLast},Manpower!$F$${mFirst}:$F$${mLast},$B${rn})`,s.mp), F(`SUMIFS(Assets!$P$${aFirst}:$P$${aLast},Assets!$F$${aFirst}:$F$${aLast},$B${rn})`,s.as), F(`E${rn}+F${rn}`,s.mp+s.as), F(`D${rn}-G${rn}`,s.wd-s.mp-s.as), F(`IFERROR(H${rn}/D${rn},"")`, s.wd?(s.wd-s.mp-s.as)/s.wd:'')];
+    r.values=['',t, F(`COUNTIFS('Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.jobs), F(`SUMIFS('Work-1'!$X$${wFirst}:$X$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.wd), F(`SUMIFS(Manpower!$M$${mFirst}:$M$${mLast},Manpower!$F$${mFirst}:$F$${mLast},$B${rn})`,s.mp), F(`SUMIFS(Assets!$P$${aFirst}:$P$${aLast},Assets!$F$${aFirst}:$F$${aLast},$B${rn})+SUMIFS('Work-1'!$AA$${wFirst}:$AA$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.as), F(`E${rn}+F${rn}`,s.mp+s.as), F(`D${rn}-G${rn}`,s.wd-s.mp-s.as), F(`IFERROR(H${rn}/D${rn},"")`, s.wd?(s.wd-s.mp-s.as)/s.wd:'')];
     r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,i); rn++; });
   { const r=ws.getRow(rn); const ua=assets.filter(a=>!a.team).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0); r.values=['','Unallocated asset hire',0,0,0, F(`SUMPRODUCT((Assets!$F$${aFirst}:$F$${aLast}="")*Assets!$P$${aFirst}:$P$${aLast})`,ua), F(`E${rn}+F${rn}`,ua), F(`D${rn}-G${rn}`,-ua), F(`IFERROR(H${rn}/D${rn},"")`,'')]; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,1); rn++; }
   const tLastListed=rn-1;
   { const r=ws.getRow(rn); const listedTeams=teams; const oj=work.filter(w=>!listedTeams.includes(w.team)).length, ow=work.filter(w=>!listedTeams.includes(w.team)).reduce((s,w)=>s+Number(w.amount||0),0);
-    r.values=['','Other / team not listed above', F(`COUNTA('Work-1'!$G$${wFirst}:$G$${wLast})-SUM(C${tFirst}:C${tLastListed})`,oj), F(`'Work-1'!$X$${wTot}-SUM(D${tFirst}:D${tLastListed})`,ow), F(`Manpower!$M$${mTot}-SUM(E${tFirst}:E${tLastListed})`,0), F(`Assets!$P$${aTot}-SUM(F${tFirst}:F${tLastListed})`,0), F(`E${rn}+F${rn}`,0), F(`D${rn}-G${rn}`,ow), F(`IFERROR(H${rn}/D${rn},"")`,'')]; r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,0); rn++; }
-  { const r=ws.getRow(rn); r.values=['','TOTAL', F(`SUM(C${tFirst}:C${rn-1})`,work.length), F(`SUM(D${tFirst}:D${rn-1})`,workDone), F(`SUM(E${tFirst}:E${rn-1})`,manpowerTot), F(`SUM(F${tFirst}:F${rn-1})`,hireTot+fuelTot), F(`SUM(G${tFirst}:G${rn-1})`,totalCost), F(`SUM(H${tFirst}:H${rn-1})`,net), F(`IFERROR(H${rn}/D${rn},"")`,workDone?net/workDone:'')]; r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; totalRow(r,2,9); rn+=3; }
+    r.values=['','Other / team not listed above', F(`COUNTA('Work-1'!$G$${wFirst}:$G$${wLast})-SUM(C${tFirst}:C${tLastListed})`,oj), F(`'Work-1'!$X$${wTot}-SUM(D${tFirst}:D${tLastListed})`,ow), F(`Manpower!$M$${mTot}-SUM(E${tFirst}:E${tLastListed})`,0), F(`Assets!$P$${aTot}+'Work-1'!$AA$${wTot}-SUM(F${tFirst}:F${tLastListed})`,0), F(`E${rn}+F${rn}`,0), F(`D${rn}-G${rn}`,ow), F(`IFERROR(H${rn}/D${rn},"")`,'')]; r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; zebra(r,2,9,0); rn++; }
+  { const r=ws.getRow(rn); r.values=['','TOTAL', F(`SUM(C${tFirst}:C${rn-1})`,work.length), F(`SUM(D${tFirst}:D${rn-1})`,workDone), F(`SUM(E${tFirst}:E${rn-1})`,manpowerTot), F(`SUM(F${tFirst}:F${rn-1})`,hireTot+fuelTot+matTot), F(`SUM(G${tFirst}:G${rn-1})`,totalCost), F(`SUM(H${tFirst}:H${rn-1})`,net), F(`IFERROR(H${rn}/D${rn},"")`,workDone?net/workDone:'')]; r.getCell(3).numFmt=RPT.int; [4,5,6,7,8].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(9).numFmt=RPT.pct; totalRow(r,2,9); rn+=3; }
 
   band(ws,`B${rn}:I${rn}`,'ASSET HIRE & UTILISATION'); rn++;
   ws.getRow(rn).values=['','Asset Class','Assigned','Used','Hire Charged (BD)','Hrs Available','Hrs Used','Utilisation %','Idle Hire (BD)']; styleHeader(ws.getRow(rn),2,9); rn++;
@@ -1676,6 +1682,9 @@ const ENTITIES = {
       {key:'qty', label:'Qty', type:'number', w:60, num:true, default:()=>1},
       {key:'hours', label:'Hours', type:'number', w:70, num:true},
       {key:'amount', label:'Work done (BD)', type:'money', w:120, num:true, hint:'Value of the work — the revenue side of the profit calculation'},
+      {key:'mat_cost', label:'Material cost (BD)', type:'money', w:120, num:true, moneyOnly:true, hint:'Purchase cost of bricks / concrete / asphalt / kerbs (Import & settings → Reinstatement material costs). Profit = work done − materials − manpower − hire.'},
+      {key:'stage', label:'Reinstatement stage', type:'combo', options:['Assigned','Filling','Check','Review','Waiting Payment','Completed','Paid'], badge:true, w:140, hint:'From the Reinstatement Cost Report Status column'},
+      {key:'done_date', label:'Reinstatement completed on', type:'date', hideInTable:true, hint:'From the Reinstatement Completed KPI export'},
       {key:'materials', label:'Site details / materials used', type:'textarea', hideInTable:true},
       {key:'follow_up', label:'Follow-up required', type:'select', options:['NO','YES'], w:90},
       {key:'fault', label:'Fault (BOQ)', type:'combo', options:FAULT_PRICES.map(f=>f[0]), hideInTable:true, section:'BOQ detail (fills the Daily Report Work sheet)'},
@@ -1694,7 +1703,7 @@ const ENTITIES = {
       {key:'unit', label:'Unit', type:'text', hideInTable:true}
     ],
     search:['work_order','requested_by','location','category','description','team','fault','area'], dateField:'date', defaultSort:{field:'date', dir:'desc'},
-    chips:[{id:'', label:'All'},{id:'done', label:'Completed', where:'status="Completed"'},{id:'open', label:'Not completed', where:'status<>"Completed"'},{id:'fu', label:'Follow-up', where:'follow_up="YES"'}]
+    chips:[{id:'', label:'All'},{id:'done', label:'Completed', where:'status="Completed"'},{id:'open', label:'Not completed', where:'status<>"Completed"'},{id:'fu', label:'Follow-up', where:'follow_up="YES"'},{id:'rn', label:'Reinstatement', where:'category="Reinstatement"'},{id:'rchk', label:'Stage: Check', where:'stage="Check"'},{id:'rrev', label:'Stage: Review', where:'stage="Review"'},{id:'rwp', label:'Stage: Waiting Payment', where:'stage="Waiting Payment"'},{id:'rcomp', label:'Stage: Completed / Paid', where:'stage IN ("Completed","Paid")'}]
   },
   employees: { table:'employees', label:'Employees', singular:'Employee', icon:ICONS.users, group:'Cost',
     columns:[
@@ -2016,6 +2025,7 @@ function badgeTone(key, col, val){
     return 'info';
   }
   if(col==='maint_type') return v.includes('preventive')||v.includes('inspection') ? 'good' : v.includes('accident') ? 'bad' : 'warn';
+  if(col==='stage'){ if(/completed|paid/.test(v)) return 'good'; if(/waiting/.test(v)) return 'info'; if(/check|review/.test(v)) return 'warn'; return 'neutral'; }
   if(col==='type') return v==='in' ? 'good' : 'bad';
   if(col==='asset_type') return v==='vehicle' ? 'info' : 'neutral';
   return 'info';
@@ -2530,16 +2540,19 @@ function costSummary(from, to, opts){
   const workByCat = q('SELECT category, COUNT(*) jobs, SUM(qty) qty, SUM(amount) amount, SUM(CASE WHEN status="Completed" THEN 1 ELSE 0 END) done FROM work_log WHERE date>=? AND date<=? GROUP BY category ORDER BY amount DESC',[from,to]);
   const workByTeam = q('SELECT team, COUNT(*) jobs, SUM(amount) amount, SUM(hours) hours FROM work_log WHERE date>=? AND date<=? GROUP BY team',[from,to]);
   const work = { total: workByCat.reduce((s,r)=>s+Number(r.amount||0),0), jobs: workByCat.reduce((s,r)=>s+r.jobs,0), done: workByCat.reduce((s,r)=>s+r.done,0) };
+  const matByTeam = q('SELECT team, SUM(COALESCE(mat_cost,0)) m FROM work_log WHERE date>=? AND date<=? AND COALESCE(mat_cost,0)<>0 GROUP BY team',[from,to]);
+  const matTot = matByTeam.reduce((s,r)=>s+Number(r.m||0),0);
   // by team
   const teams = {};
-  const T = n=> teams[n] = teams[n] || {team:n, jobs:0, work:0, labor:0, hire:0, exp:0, staff:0};
+  const T = n=> teams[n] = teams[n] || {team:n, jobs:0, work:0, labor:0, hire:0, exp:0, mat:0, staff:0};
+  matByTeam.forEach(r=>{ T(canon(r.team)||'Unassigned').mat+=Number(r.m||0); });
   labor.forEach(r=>{ const t=T(r.team); t.labor+=r.total; if(r.days_worked>0) t.staff++; });
   veh.concat(eq).forEach(a=> a.daily.forEach(x=>{ T(canon(x.team)||'Unallocated').hire+=x.cost; }));
   expRows.forEach(r=>{ T(canon(r.team2)||'Unallocated').exp+=Number(r.amount||0); });
   workByTeam.forEach(r=>{ const t=T(canon(r.team)||'Unassigned'); t.jobs+=r.jobs; t.work+=Number(r.amount||0); });
-  Object.values(teams).forEach(t=>{ t.cost=t.labor+t.hire+t.exp; t.net=t.work-t.cost; t.margin=t.work?t.net/t.work:null; });
-  const cost = laborTot.total + hireTot.total + expTot + purchTot;
-  return { from, to, nDays, labor, laborTot, veh, eq, hireTot, expByCat, expRows, expTot, fuelTot, purchases, purchTot, workByCat, work, teams:Object.values(teams).sort((a,b)=>b.work-a.work||b.cost-a.cost), cost, net: work.total-cost, margin: work.total? (work.total-cost)/work.total : null };
+  Object.values(teams).forEach(t=>{ t.cost=t.labor+t.hire+t.exp+t.mat; t.net=t.work-t.cost; t.margin=t.work?t.net/t.work:null; });
+  const cost = laborTot.total + hireTot.total + expTot + purchTot + matTot;
+  return { from, to, nDays, labor, laborTot, veh, eq, hireTot, expByCat, expRows, expTot, fuelTot, purchases, purchTot, matTot, matByTeam, workByCat, work, teams:Object.values(teams).sort((a,b)=>b.work-a.work||b.cost-a.cost), cost, net: work.total-cost, margin: work.total? (work.total-cost)/work.total : null };
 }
 function trendSeries(mode, anchor){
   const out=[]; const push=(label,from,to)=>{ const s=costSummary(from,to,{skipUtil:true, project:COST_PROJECT}); out.push({label, series:[s.laborTot.total, s.hireTot.total, s.expTot+s.purchTot], line:s.work.total, jobs:s.work.jobs}); };
@@ -2624,6 +2637,7 @@ function renderDashboard(){
   const boqN = n('SELECT COUNT(*) FROM work_log WHERE date=? AND category<>"Reinstatement"',[cd]), boqAmt = n('SELECT SUM(amount) FROM work_log WHERE date=? AND category<>"Reinstatement"',[cd]);
   const rnN = n('SELECT COUNT(*) FROM work_log WHERE date=? AND category="Reinstatement"',[cd]), rnAmt = n('SELECT SUM(amount) FROM work_log WHERE date=? AND category="Reinstatement"',[cd]);
   const rnTeams = q('SELECT team, COUNT(*) c FROM work_log WHERE date=? AND category="Reinstatement" GROUP BY team ORDER BY c DESC',[cd]).map(r=>`${r.team||'—'} ${r.c}`).join(' · ');
+  const rnWait = n('SELECT COUNT(*) FROM work_log WHERE category="Reinstatement" AND stage IN ("Check","Review","Waiting Payment")');
   const tsN = n('SELECT COUNT(*) FROM attendance WHERE date=?',[cd]);
   const mvN = n('SELECT (SELECT COUNT(*) FROM vehicle_moves WHERE date_out=?)+(SELECT COUNT(*) FROM equipment_moves WHERE date_out=?)',[cd,cd]);
   const openN = n('SELECT (SELECT COUNT(*) FROM vehicle_moves WHERE return_date IS NULL OR return_date="")+(SELECT COUNT(*) FROM equipment_moves WHERE return_date IS NULL OR return_date="")');
@@ -2632,7 +2646,7 @@ function renderDashboard(){
   const step = (done, title, detail, btnLabel, action, extra)=>`<div class="step ${done?'done':''}"><div class="step-ico">${done?ICONS.check:'<span class="step-n"></span>'}</div><div class="step-body"><div class="step-title">${title}</div><div class="step-detail">${detail}</div></div>${btnLabel?`<button class="btn btn-sm ${done?'':'btn-primary'}" ${action}>${btnLabel}</button>`:''}${extra||''}</div>`;
   const checklist = `<div class="panel checklist"><div class="panel-head"><h3>Checklist for <input type="date" class="inp" id="dash-date" value="${cd}" style="height:30px;padding:2px 8px;font-size:13px"> ${isToday?'<span class="tag">today</span>':''}</h3><span class="tag">${[boqN>0,rnN>0,tsN>0,mvN>0||openN>0,stN>0,fuelN>0].filter(Boolean).length} of 6 done</span></div><div class="panel-body steps">
     ${step(boqN>0, 'BOQ jobs', boqN? `${boqN} jobs · work done ${money(boqAmt)} ${CURRENCY}` : 'No jobs for this date yet — upload the BOQ export', 'Upload BOQ', 'data-upload="boq"')}
-    ${step(rnN>0, 'Reinstatement jobs', rnN? `${rnN} jobs · work done ${money(rnAmt)} ${CURRENCY} · ${rnTeams}` : 'No reinstatement jobs for this date yet — upload the Reinstatement Cost Report', 'Upload reinstatement', 'data-upload="reinst"')}
+    ${step(rnN>0, 'Reinstatement jobs', rnN? `${rnN} jobs · work done ${money(rnAmt)} ${CURRENCY} · ${rnTeams}${rnWait?` · ${rnWait} awaiting payment overall`:''}` : 'No reinstatement jobs for this date yet — upload the Reinstatement Cost Report (and the Completed KPI for finish dates)', 'Upload reinstatement', 'data-upload="reinst"')}
     ${step(tsN>0, 'Attendance', tsN? `${tsN} people on the timesheet · ${n('SELECT COUNT(*) FROM attendance WHERE date=? AND status="Working"',[cd])} working` : 'No timesheet for this date yet', 'Upload timesheet', 'data-upload="ts"')}
     ${step(mvN>0||openN>0, 'Vehicle & equipment movements', `${mvN} check-outs on this date · ${openN} out now`, 'Check out', 'data-form="vehicle_moves"')}
     ${step(fuelN>0, 'Fuel & expenses', fuelN? `${fuelN} entries · ${money(fuelAmt)} ${CURRENCY}` : 'Nothing logged for this date', 'Log fuel', `data-form="expenses" data-preset='{"category":"Fuel","date":"${cd}"}'`)}
@@ -2717,15 +2731,15 @@ function renderCost(){
       ${kpi('Asset hire', money(s.hireTot.total), `${s.veh.length} vehicles · ${s.eq.length} equipment · idle ${money(s.hireTot.idle)}`, 'warn', 'vehicles', 'rent')}
       ${kpi('Fuel & expenses', money(s.expTot), `fuel ${money(s.fuelTot)} · ${pct(s.expTot)}`, '', 'expenses')}
       ${kpi('Purchases', money(s.purchTot), `${s.purchases.length} items received`, '', 'stock_moves', 'in')}
-      ${can('salary')? kpi('Total cost', money(s.cost), `${label} · ${s.nDays} day${s.nDays===1?'':'s'}`, '') : kpi('Hire + fuel + purchases', money(s.hireTot.total+s.expTot+s.purchTot), `${label} · excludes manpower`, '')}
+      ${can('salary')? kpi('Total cost', money(s.cost), `${label} · ${s.nDays} day${s.nDays===1?'':'s'}${s.matTot?` · materials ${money(s.matTot)}`:''}`, '') : kpi('Hire + fuel + purchases', money(s.hireTot.total+s.expTot+s.purchTot+s.matTot), `${label} · excludes manpower`, '')}
       ${can('salary')? kpi('Net profit', money(s.net), `margin ${marginTxt}`, s.net<0?'bad':'good') : ''}
     </div>
     ${missing.length?`<div class="field-note" style="margin-bottom:14px">Incomplete data: ${missing.join(' · ')}.</div>`:''}
     <div class="panels-row">
       <div class="panel"><div class="panel-head"><h3>Cost vs work done — ${trendTitle}</h3><span class="tag">${CURRENCY}</span></div><div class="panel-body pad">${svgBars(trend,['Manpower','Asset hire','Fuel, expenses & purchases'])}</div>${LEGEND_COST}</div>
-      <div class="panel"><div class="panel-head"><h3>${can('salary')?'Cost breakdown':'Hire, fuel &amp; purchases'}</h3><span class="tag">${money(can('salary')?s.cost:(s.hireTot.total+s.expTot+s.purchTot))}</span></div><div class="panel-body pad">${(can('salary')?[['Manpower — basic',s.laborTot.basic],['Manpower — overtime',s.laborTot.ot],['Manpower — food allowance',s.laborTot.food]]:[]).concat([['Vehicle hire',s.hireTot.veh],['Equipment hire',s.hireTot.eq],['Fuel',s.fuelTot],['Other expenses',s.expTot-s.fuelTot],['Stock purchases',s.purchTot]]).map(([n,v])=>`<div class="bar-item"><div class="bar-top"><span class="bname">${n}</span><span class="bval">${money(v)} · ${pct(v)}</span></div><div class="bar-track"><div class="bar-fill amber" style="width:${(can('salary')?s.cost:(s.hireTot.total+s.expTot+s.purchTot))?Math.max(1,v/(can('salary')?s.cost:(s.hireTot.total+s.expTot+s.purchTot))*100).toFixed(0):0}%"></div></div></div>`).join('')}</div></div>
+      <div class="panel"><div class="panel-head"><h3>${can('salary')?'Cost breakdown':'Hire, fuel &amp; purchases'}</h3><span class="tag">${money(can('salary')?s.cost:(s.hireTot.total+s.expTot+s.purchTot))}</span></div><div class="panel-body pad">${(can('salary')?[['Manpower — basic',s.laborTot.basic],['Manpower — overtime',s.laborTot.ot],['Manpower — food allowance',s.laborTot.food]]:[]).concat([['Vehicle hire',s.hireTot.veh],['Equipment hire',s.hireTot.eq],['Fuel',s.fuelTot],['Other expenses',s.expTot-s.fuelTot],['Stock purchases',s.purchTot],['Reinstatement materials',s.matTot]]).map(([n,v])=>`<div class="bar-item"><div class="bar-top"><span class="bname">${n}</span><span class="bval">${money(v)} · ${pct(v)}</span></div><div class="bar-track"><div class="bar-fill amber" style="width:${(can('salary')?s.cost:(s.hireTot.total+s.expTot+s.purchTot))?Math.max(1,v/(can('salary')?s.cost:(s.hireTot.total+s.expTot+s.purchTot))*100).toFixed(0):0}%"></div></div></div>`).join('')}</div></div>
     </div>
-    <div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Team performance</h3><span class="tag">${can('salary')?'work done − (manpower + hire + expenses)':'work done, asset hire and expenses per team'}</span></div><div class="panel-body">${s.teams.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Team</th><th class="num">Staff</th><th class="num">Jobs</th><th class="num">Work done</th>${can('salary')?'<th class="num">Manpower</th>':''}<th class="num">Asset hire</th><th class="num">Expenses</th>${can('salary')?'<th class="num">Total cost</th><th class="num">Net</th><th class="num">Margin</th>':''}</tr></thead><tbody>${s.teams.map(t=>`<tr><td>${esc(t.team)}</td><td class="num mono">${t.staff}</td><td class="num mono">${t.jobs}</td><td class="num mono">${money(t.work)}</td>${can('salary')?`<td class="num mono">${money(t.labor)}</td>`:''}<td class="num mono">${money(t.hire)}</td><td class="num mono">${money(t.exp)}</td>${can('salary')?`<td class="num mono">${money(t.cost)}</td><td class="num mono" style="color:${t.net<0?'var(--bad)':'var(--good)'}">${money(t.net)}</td><td class="num mono">${t.margin===null?'—':Math.round(t.margin*100)+'%'}</td>`:''}</tr>`).join('')}</tbody><tfoot><tr><td>Total</td><td class="num mono">${s.laborTot.staff}</td><td class="num mono">${s.work.jobs}</td><td class="num mono">${money(s.work.total)}</td>${can('salary')?`<td class="num mono">${money(s.laborTot.total)}</td>`:''}<td class="num mono">${money(s.hireTot.total)}</td><td class="num mono">${money(s.expTot)}</td>${can('salary')?`<td class="num mono">${money(s.laborTot.total+s.hireTot.total+s.expTot)}</td><td class="num mono">${money(s.work.total-s.laborTot.total-s.hireTot.total-s.expTot)}</td><td class="num mono">${s.work.total?Math.round((s.work.total-s.laborTot.total-s.hireTot.total-s.expTot)/s.work.total*100)+'%':'—'}</td>`:''}</tr></tfoot></table></div>`:`<div class="empty-row">No teams have work in this period.</div>`}</div></div>
+    <div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Team performance</h3><span class="tag">${can('salary')?'work done − (manpower + hire + expenses)':'work done, asset hire and expenses per team'}</span></div><div class="panel-body">${s.teams.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Team</th><th class="num">Staff</th><th class="num">Jobs</th><th class="num">Work done</th>${can('salary')?'<th class="num">Manpower</th>':''}<th class="num">Asset hire</th><th class="num">Expenses &amp; materials</th>${can('salary')?'<th class="num">Total cost</th><th class="num">Net</th><th class="num">Margin</th>':''}</tr></thead><tbody>${s.teams.map(t=>`<tr><td>${esc(t.team)}</td><td class="num mono">${t.staff}</td><td class="num mono">${t.jobs}</td><td class="num mono">${money(t.work)}</td>${can('salary')?`<td class="num mono">${money(t.labor)}</td>`:''}<td class="num mono">${money(t.hire)}</td><td class="num mono">${money(t.exp+t.mat)}</td>${can('salary')?`<td class="num mono">${money(t.cost)}</td><td class="num mono" style="color:${t.net<0?'var(--bad)':'var(--good)'}">${money(t.net)}</td><td class="num mono">${t.margin===null?'—':Math.round(t.margin*100)+'%'}</td>`:''}</tr>`).join('')}</tbody><tfoot><tr><td>Total</td><td class="num mono">${s.laborTot.staff}</td><td class="num mono">${s.work.jobs}</td><td class="num mono">${money(s.work.total)}</td>${can('salary')?`<td class="num mono">${money(s.laborTot.total)}</td>`:''}<td class="num mono">${money(s.hireTot.total)}</td><td class="num mono">${money(s.expTot+s.matTot)}</td>${can('salary')?`<td class="num mono">${money(s.laborTot.total+s.hireTot.total+s.expTot+s.matTot)}</td><td class="num mono">${money(s.work.total-s.laborTot.total-s.hireTot.total-s.expTot-s.matTot)}</td><td class="num mono">${s.work.total?Math.round((s.work.total-s.laborTot.total-s.hireTot.total-s.expTot-s.matTot)/s.work.total*100)+'%':'—'}</td>`:''}</tr></tfoot></table></div>`:`<div class="empty-row">No teams have work in this period.</div>`}</div></div>
     <div class="panels-row">
       <div class="panel"><div class="panel-head"><h3>Work done by category</h3><span class="tag">${s.work.jobs} jobs</span></div><div class="panel-body">${s.workByCat.length?`<table class="plain"><thead><tr><th>Category</th><th class="num">Jobs</th><th class="num">Done</th><th class="num">Amount</th><th class="num">%</th></tr></thead><tbody>${s.workByCat.map(r=>`<tr><td>${esc(r.category)}</td><td class="num mono">${r.jobs}</td><td class="num mono">${r.done}</td><td class="num mono">${money(r.amount)}</td><td class="num mono">${s.work.total?Math.round(r.amount/s.work.total*100):0}%</td></tr>`).join('')}</tbody></table>`:`<div class="empty-row">No jobs logged. Use "Log job" or import the Work sheet of a daily cost report.</div>`}</div></div>
       <div class="panel"><div class="panel-head"><h3>Fuel & expenses</h3><span class="tag">${money(s.expTot)}</span></div><div class="panel-body">${s.expByCat.length?`<table class="plain"><thead><tr><th>Category</th><th class="num">Entries</th><th class="num">Amount</th></tr></thead><tbody>${s.expByCat.map(r=>`<tr><td>${esc(r.category)}</td><td class="num mono">${r.n}</td><td class="num mono">${money(r.amount)}</td></tr>`).join('')}</tbody></table>`:`<div class="empty-row">No fuel or expenses logged in this period.</div>`}</div></div>
@@ -2791,14 +2805,14 @@ async function exportCostReport(s, label){
   const DPM='Assumptions!$C$5', HPD='Assumptions!$C$6', OTM='Assumptions!$C$7', OTH='Assumptions!$C$8', FOOD='Assumptions!$C$9';
 
   /* ---------- Work ---------- */
-  const work = q('SELECT date, work_order, requested_by, location, category, description, team, status, qty, hours, amount, materials, follow_up FROM work_log WHERE date>=? AND date<=? ORDER BY date, id',[s.from,s.to]).map(w=>({...w, team:canon(w.team)||'Unassigned'}));
-  const wsW = sheet('Work','WORK LOG',subLine,[7,12,16,16,24,26,40,14,14,7,9,14,34,11],3);
-  header(wsW,4,1,['S/N','Date','Work Order No.','Requested By','Location','Work Category','Work Description','Team','Job Status','Qty','Duration (Hrs)','Work Done (BD)','Site Details / Materials Used','Follow-up']);
+  const work = q('SELECT date, work_order, requested_by, location, category, description, team, status, qty, hours, amount, materials, follow_up, COALESCE(mat_cost,0) mat_cost, COALESCE(stage,"") stage FROM work_log WHERE date>=? AND date<=? ORDER BY date, id',[s.from,s.to]).map(w=>({...w, team:canon(w.team)||'Unassigned'}));
+  const wsW = sheet('Work','WORK LOG',subLine,[7,12,16,16,24,26,40,14,14,7,9,14,34,11,13,15],3);
+  header(wsW,4,1,['S/N','Date','Work Order No.','Requested By','Location','Work Category','Work Description','Team','Job Status','Qty','Duration (Hrs)','Work Done (BD)','Site Details / Materials Used','Follow-up','Material Cost (BD)','Reinstatement Stage']);
   const wF=5, wL=wF+Math.max(work.length,1)-1, wT=wL+1;
-  work.forEach((w,i)=>{ const n=wF+i; wsW.getRow(n).values=[F('ROW()-4',i+1), xd(w.date), w.work_order, w.requested_by, w.location, w.category, w.description, w.team, w.status, Number(w.qty||0), Number(w.hours||0), Number(w.amount||0), w.materials, w.follow_up]; bodyRow(wsW,n,1,14,i); });
-  wsW.getRow(wT).values=['TOTAL','','','','','','','','',F(`SUM(J${wF}:J${wL})`,work.reduce((x,w)=>x+Number(w.qty||0),0)),F(`SUM(K${wF}:K${wL})`,work.reduce((x,w)=>x+Number(w.hours||0),0)),F(`SUM(L${wF}:L${wL})`,s.work.total)]; totalsRow(wsW,wT,1,14);
-  nf(wsW,[2],RPT.date,wF,wL); nf(wsW,[12],RPT.money,wF,wT); nf(wsW,[11],RPT.hrs,wF,wT);
-  wsW.autoFilter={from:{row:4,column:1},to:{row:4,column:14}};
+  work.forEach((w,i)=>{ const n=wF+i; wsW.getRow(n).values=[F('ROW()-4',i+1), xd(w.date), w.work_order, w.requested_by, w.location, w.category, w.description, w.team, w.status, Number(w.qty||0), Number(w.hours||0), Number(w.amount||0), w.materials, w.follow_up, Number(w.mat_cost||0), w.stage]; bodyRow(wsW,n,1,16,i); });
+  wsW.getRow(wT).values=['TOTAL','','','','','','','','',F(`SUM(J${wF}:J${wL})`,work.reduce((x,w)=>x+Number(w.qty||0),0)),F(`SUM(K${wF}:K${wL})`,work.reduce((x,w)=>x+Number(w.hours||0),0)),F(`SUM(L${wF}:L${wL})`,s.work.total),'','',F(`SUM(O${wF}:O${wL})`,s.matTot)]; totalsRow(wsW,wT,1,16);
+  nf(wsW,[2],RPT.date,wF,wL); nf(wsW,[12,15],RPT.money,wF,wT); nf(wsW,[11],RPT.hrs,wF,wT);
+  wsW.autoFilter={from:{row:4,column:1},to:{row:4,column:16}};
   const W = c=>R('Work',c,wF,wL);
 
   /* ---------- Manpower ---------- */
@@ -2858,7 +2872,7 @@ async function exportCostReport(s, label){
   // KPI boxes
   const WD='$B$8';
   const CB=13;  // first body row of the two side tables
-  const costRows=['Manpower — basic','Manpower — overtime','Manpower — food allowance','Vehicle hire','Equipment hire','Fuel','Other expenses & maint.','Stock purchases','TOTAL COST','NET PROFIT','MARGIN','Idle hire (hired, not used)'];
+  const costRows=['Manpower — basic','Manpower — overtime','Manpower — food allowance','Vehicle hire','Equipment hire','Fuel','Other expenses & maint.','Stock purchases','Reinstatement materials','TOTAL COST','NET PROFIT','MARGIN','Idle hire (hired, not used)'];
   const cr = n=> CB+costRows.indexOf(n);   // row of a cost element
   const kpis=[['B','C','WORK DONE',F(`SUM(${W('L')})`,s.work.total),RPT.moneyBD,'value of jobs logged'],
               ['D','E','TOTAL COST',F(`J${cr('TOTAL COST')}`,s.cost),RPT.moneyBD,'all cost elements'],
@@ -2880,8 +2894,8 @@ async function exportCostReport(s, label){
   const costF = {
     'Manpower — basic':[`SUM(${M('K')})`,s.laborTot.basic], 'Manpower — overtime':[`SUM(${M('O')})`,s.laborTot.ot], 'Manpower — food allowance':[`SUM(${M('Q')})`,s.laborTot.food],
     'Vehicle hire':[`SUMIF(${AH('C')},"Vehicle",${AH('L')})`,s.hireTot.veh], 'Equipment hire':[`SUMIF(${AH('C')},"Equipment",${AH('L')})`,s.hireTot.eq],
-    'Fuel':[`SUMIF(${E('C')},"Fuel",${E('H')})`,s.fuelTot], 'Other expenses & maint.':[`SUM(${E('H')})-J${cr('Fuel')}`,s.expTot-s.fuelTot], 'Stock purchases':[`SUM(${P('D')})`,s.purchTot],
-    'TOTAL COST':[`SUM(J${CB}:J${cr('Stock purchases')})`,s.cost], 'NET PROFIT':[`${WD}-J${cr('TOTAL COST')}`,s.net], 'MARGIN':[`IFERROR(J${cr('NET PROFIT')}/${WD},0)`,s.margin===null?0:s.margin],
+    'Fuel':[`SUMIF(${E('C')},"Fuel",${E('H')})`,s.fuelTot], 'Other expenses & maint.':[`SUM(${E('H')})-J${cr('Fuel')}`,s.expTot-s.fuelTot], 'Stock purchases':[`SUM(${P('D')})`,s.purchTot], 'Reinstatement materials':[`SUM(${W('O')})`,s.matTot],
+    'TOTAL COST':[`SUM(J${CB}:J${cr('Reinstatement materials')})`,s.cost], 'NET PROFIT':[`${WD}-J${cr('TOTAL COST')}`,s.net], 'MARGIN':[`IFERROR(J${cr('NET PROFIT')}/${WD},0)`,s.margin===null?0:s.margin],
     'Idle hire (hired, not used)':[`SUM(${AH('O')})`,s.hireTot.idle] };
   costRows.forEach((name,i)=>{ const n=CB+i, [f,v]=costF[name]; ws.mergeCells(n,8,n,9); ws.getCell(n,8).value=name; ws.getCell(n,10).value=F(f,v); ws.getCell(n,10).numFmt = name==='MARGIN'?RPT.pct:RPT.money;
     if(name!=='MARGIN'){ ws.getCell(n,11).value=F(`IFERROR(J${n}/${WD},0)`,s.work.total?v/s.work.total:0); ws.getCell(n,11).numFmt=RPT.pct; }
@@ -2889,13 +2903,13 @@ async function exportCostReport(s, label){
     if(name.startsWith('Idle')) [8,10,11].forEach(c=>font(ws.getCell(n,c),{italic:true,size:9,color:{argb:K.muted}})); });
   // Team performance
   let r0 = Math.max(catT, CB+costRows.length-1) + 3;
-  band(ws,r0,2,11,'TEAM PERFORMANCE'); header(ws,r0+1,2,['Team','Staff','Jobs','Work Done (BD)','Manpower (BD)','Asset Hire (BD)','Expenses (BD)','Total Cost (BD)','Net (BD)','Margin %']);
+  band(ws,r0,2,11,'TEAM PERFORMANCE'); header(ws,r0+1,2,['Team','Staff','Jobs','Work Done (BD)','Manpower (BD)','Asset Hire (BD)','Expenses & Materials (BD)','Total Cost (BD)','Net (BD)','Margin %']);
   const tF=r0+2; s.teams.forEach((t,i)=>{ const n=tF+i;
-    ws.getRow(n).values=['',t.team,F(`COUNTIFS(${M('D')},B${n},${M('G')},">0")`,t.staff),F(`COUNTIF(${W('H')},B${n})`,t.jobs),F(`SUMIF(${W('H')},B${n},${W('L')})`,t.work),F(`SUMIF(${M('D')},B${n},${M('R')})`,t.labor),F(`SUMIF(${AH('F')},B${n},${AH('L')})`,t.hire),F(`SUMIF(${E('F')},B${n},${E('H')})`,t.exp),F(`F${n}+G${n}+H${n}`,t.cost),F(`E${n}-I${n}`,t.net),F(`IFERROR(J${n}/E${n},0)`,t.margin===null?0:t.margin)];
+    ws.getRow(n).values=['',t.team,F(`COUNTIFS(${M('D')},B${n},${M('G')},">0")`,t.staff),F(`COUNTIF(${W('H')},B${n})`,t.jobs),F(`SUMIF(${W('H')},B${n},${W('L')})`,t.work),F(`SUMIF(${M('D')},B${n},${M('R')})`,t.labor),F(`SUMIF(${AH('F')},B${n},${AH('L')})`,t.hire),F(`SUMIF(${E('F')},B${n},${E('H')})+SUMIF(${W('H')},B${n},${W('O')})`,t.exp+t.mat),F(`F${n}+G${n}+H${n}`,t.cost),F(`E${n}-I${n}`,t.net),F(`IFERROR(J${n}/E${n},0)`,t.margin===null?0:t.margin)];
     [5,6,7,8,9,10].forEach(c=>ws.getCell(n,c).numFmt=RPT.money); ws.getCell(n,11).numFmt=RPT.pct; bodyRow(ws,n,2,11,i); });
   const tL=tF+Math.max(s.teams.length,1)-1, tT=tL+1;
-  { const tc=s.laborTot.total+s.hireTot.total+s.expTot, tn=s.work.total-tc;
-    ws.getRow(tT).values=['','TOTAL',F(`SUM(C${tF}:C${tL})`,s.laborTot.staff),F(`SUM(D${tF}:D${tL})`,s.work.jobs),F(`SUM(E${tF}:E${tL})`,s.work.total),F(`SUM(F${tF}:F${tL})`,s.laborTot.total),F(`SUM(G${tF}:G${tL})`,s.hireTot.total),F(`SUM(H${tF}:H${tL})`,s.expTot),F(`SUM(I${tF}:I${tL})`,tc),F(`E${tT}-I${tT}`,tn),F(`IFERROR(J${tT}/E${tT},0)`,s.work.total?tn/s.work.total:0)];
+  { const tc=s.laborTot.total+s.hireTot.total+s.expTot+s.matTot, tn=s.work.total-tc;
+    ws.getRow(tT).values=['','TOTAL',F(`SUM(C${tF}:C${tL})`,s.laborTot.staff),F(`SUM(D${tF}:D${tL})`,s.work.jobs),F(`SUM(E${tF}:E${tL})`,s.work.total),F(`SUM(F${tF}:F${tL})`,s.laborTot.total),F(`SUM(G${tF}:G${tL})`,s.hireTot.total),F(`SUM(H${tF}:H${tL})`,s.expTot+s.matTot),F(`SUM(I${tF}:I${tL})`,tc),F(`E${tT}-I${tT}`,tn),F(`IFERROR(J${tT}/E${tT},0)`,s.work.total?tn/s.work.total:0)];
     [5,6,7,8,9,10].forEach(c=>ws.getCell(tT,c).numFmt=RPT.money); ws.getCell(tT,11).numFmt=RPT.pct; totalsRow(ws,tT,2,11); }
   ws.mergeCells(tT+1,2,tT+1,11); ws.getCell(tT+1,2).value='Stock purchases are depot-wide and are not allocated to teams, so team total cost excludes them.'; font(ws.getCell(tT+1,2),{italic:true,size:8,color:{argb:K.muted}});
   // Asset hire & utilisation
@@ -3114,6 +3128,20 @@ function insertWork(r){
    sheet "Rates" = BOQ rates per depot (R1…R10b). Each row becomes a job in the Work log keyed by Excavation No, so
    uploading the next day's export simply updates what changed. Cost is recomputed from the file's own Rates sheet with
    the same formulas as the report (fallback: the file's Total). Team: Bricks / Concrete / Kerb Stone → Interlock, Asphalt → Asphalt. */
+/* Material (purchase) cost rates for reinstatement work — BD per brick / m³ / kerb. Set in Import & settings → Reinstatement material costs. */
+const REINST_MAT_KEYS = [['b60_yellow','60mm Yellow brick'],['b60_red','60mm Red brick'],['b60_black','60mm Black brick'],['b60_grey','60mm Grey brick'],['b80_yellow','80mm Yellow brick'],['b80_red','80mm Red brick'],['b80_black','80mm Black brick'],['b80_grey','80mm Grey brick'],['concrete','Concrete (per m³)'],['asphalt','Asphalt (per m³)'],['kerb','Kerb stone (per piece)'],['roadbase','Road base (per m³)']];
+const REINST_MAT_DEFAULT = Object.fromEntries(REINST_MAT_KEYS.map(([k])=>[k,0]));
+function matRates(){ let o={}; try{ o=JSON.parse(getSetting('reinst_mat_rates','{}'))||{}; }catch(e){} return Object.assign({}, REINST_MAT_DEFAULT, o); }
+/* "Other colour" bricks in the export are not split by colour → average of the Red / Black / Grey rates that are set */
+function matCostFromQ(qty, rates){
+  if(!qty) return 0; const R = rates||matRates(); const avg = (...ks)=>{ const v=ks.map(k=>Number(R[k])||0).filter(x=>x>0); return v.length? v.reduce((a,b)=>a+b,0)/v.length : 0; };
+  const o60 = avg('b60_red','b60_black','b60_grey'), o80 = avg('b80_red','b80_black','b80_grey');
+  const c = (qty.y60||0)*(Number(R.b60_yellow)||0) + (qty.o60||0)*o60 + (qty.y80||0)*(Number(R.b80_yellow)||0) + (qty.o80||0)*o80
+          + ((qty.kerbNew||0)+(qty.kerbOld||0))*(Number(R.kerb)||0) + (qty.conc_m3||0)*(Number(R.concrete)||0) + (qty.asph_m3||0)*(Number(R.asphalt)||0) + (qty.rb_m3||0)*(Number(R.roadbase)||0);
+  return Math.round(c*1000)/1000;
+}
+function recomputeMaterialCosts(){ const R=matRates(); q('SELECT id, reinst_q FROM work_log WHERE category="Reinstatement" AND COALESCE(reinst_q,"")<>""').forEach(r=>{ let qty=null; try{ qty=JSON.parse(r.reinst_q); }catch(e){} run('UPDATE work_log SET mat_cost=? WHERE id=?',[matCostFromQ(qty,R), r.id]); }); }
+const REINST_FINISHED = ['check','review','waiting payment','completed','paid'];
 const REINST_TEAM = {bricks:'Interlock', concrete:'Interlock', 'kerb stone':'Interlock', kerb:'Interlock', interlock:'Interlock', asphalt:'Asphalt'};
 function importReinstatement(wb){
   const sheet = wb.SheetNames.find(n=>/asphalt|data/i.test(n)) || wb.SheetNames[0];
@@ -3142,13 +3170,36 @@ function importReinstatement(wb){
     } else cost = num(r['Total']);
     cost = Math.round(cost*1000)/1000;
     if(!type || t==='excavation' || (cost<=0 && area<=0)) { run('DELETE FROM work_log WHERE work_order=? AND category=?',[exc,'Reinstatement']); return; }   // excavated, not reinstated yet
-    const date = xlDate(r['Date Received']) || todayStr();
+    const stage = S(r['Status']);
+    const done = q1('SELECT end_at FROM reinst_done WHERE exc=?',[exc]);
+    const doneDate = done && done.end_at ? done.end_at.slice(0,10) : '';
+    const date = doneDate || xlDate(r['Date Received']) || todayStr();
+    const qty = {y60, o60, y80, o80, kerbNew:newK, kerbOld:oldK, conc_m3: t==='concrete'?vol:0, asph_m3: t==='asphalt'?vol:0, rb_m3: rbVol, area, type};
+    const matCost = matCostFromQ(qty);
+    const finished = !stage || REINST_FINISHED.includes(stage.toLowerCase()) || !!doneDate;
+    const status = finished ? 'Completed' : 'Partially Completed';
     const areaName = S(r['Area']);
     const loc = [areaName, r['House']!==''?'Bldg '+S(r['House']):'', r['Road']!==''?'Rd '+S(r['Road']):'', r['Block']!==''?'Blk '+S(r['Block']):''].filter(Boolean).join(', ');
     const parts = [`${type} reinstatement`, area?`${L}×${W} m`:'' , T?`${T} cm`:'', milling?'milling':'', newK?`${newK} new kerb`:'', oldK?`${oldK} old kerb`:'', (y60+o60)?`${y60+o60}× 60mm bricks`:'', (y80+o80)?`${y80+o80}× 80mm bricks`:''].filter(Boolean);
     run('DELETE FROM work_log WHERE work_order=?',[exc]);
-    insertRow('work_log',{date, work_order:exc, requested_by:depot, depot, location:loc, category:'Reinstatement', description:parts.join(' · '), team, status:'Completed', qty:1, hours:0, amount:cost, materials:S(r['Complaint No'])?('Complaint '+S(r['Complaint No'])):'', follow_up:'NO',
-      unit:S(r['House']), building:'', road:S(r['Road']), block:S(r['Block']), area:areaName, fault:type+' reinstatement', pack:'', price:cost, add_pack:'', add_price:0, dewatering:0, tanker:0, others:0});
+    insertRow('work_log',{date, work_order:exc, requested_by:depot, depot, location:loc, category:'Reinstatement', description:parts.join(' · '), team, status, qty:1, hours:0, amount:cost, materials:S(r['Complaint No'])?('Complaint '+S(r['Complaint No'])):'', follow_up:'NO',
+      unit:S(r['House']), building:'', road:S(r['Road']), block:S(r['Block']), area:areaName, fault:type+' reinstatement', pack:'', price:cost, add_pack:'', add_price:0, dewatering:0, tanker:0, others:0,
+      stage: stage||'', done_date: doneDate, mat_cost: matCost, reinst_q: JSON.stringify(qty)});
+    n++;
+  });
+  return n;
+}
+/* Reinstatement-Completed-KPI-….xlsx — sheet "Holes": one row per excavation with the actual completion time.
+   Stored in reinst_done and applied to the matching job: the job's date becomes the completion date. */
+function importReinstKpi(wb){
+  const rs = rowsOf(wb,'Holes','Holes No') || rowsOf(wb, wb.SheetNames[wb.SheetNames.length-1], 'Holes No') || [];
+  let n=0;
+  rs.forEach(r=>{
+    const exc = S(r['Holes No']); if(!exc) return;
+    const toIso = v=>{ const d=xlDate(v); if(!d) return ''; let t=''; if(v instanceof Date) t=` ${pad(v.getHours())}:${pad(v.getMinutes())}`; else if(typeof v==='number'){ const f=v-Math.floor(v); const sec=Math.round(f*86400); t=` ${pad(Math.floor(sec/3600)%24)}:${pad(Math.floor(sec%3600/60))}`; } else { const m=String(v).match(/\d{2}:\d{2}/); if(m) t=' '+m[0]; } return d+t; };
+    const start = toIso(r['Date Time Start']), end = toIso(r['Date Time End']);
+    run('INSERT INTO reinst_done(exc,complaint,type,start_at,end_at,within72) VALUES(?,?,?,?,?,?) ON CONFLICT(exc) DO UPDATE SET complaint=excluded.complaint, type=excluded.type, start_at=excluded.start_at, end_at=excluded.end_at, within72=excluded.within72',[exc, S(r['Complaint No']), S(r['Type']), start, end, S(r['Within 72 Hours'])]);
+    if(end && /completed/i.test(S(r['Status'])||'Completed')){ run('UPDATE work_log SET done_date=?, date=?, status="Completed" WHERE work_order=? AND category="Reinstatement"',[end.slice(0,10), end.slice(0,10), exc]); }
     n++;
   });
   return n;
@@ -3159,7 +3210,7 @@ function importFiles(files, kind){
   const before = qv('SELECT COUNT(*) FROM employees');
   const next = ()=>{
     if(done>=list.length){
-      mutate(()=>{}).then(async ()=>{ if(PENDING_SALARY.length){ for(const [c,s] of PENDING_SALARY){ await setSalary(c,s); } PENDING_SALARY=[]; } render(); const created = qv('SELECT COUNT(*) FROM employees')-before; toast(`${kind==='ts'?'Timesheet':kind==='emp'?'Employee list':kind==='boq'?'BOQ complaints':kind==='reinst'?'Reinstatement jobs':'Daily cost report'}: ${rows} rows imported from ${list.length} file${list.length===1?'':'s'}${created?` · ${created} new employees created — set their salary`:''}${errs.length?` · ${errs.length} failed`:''}`, errs.length?'warn':'good'); });
+      mutate(()=>{}).then(async ()=>{ if(PENDING_SALARY.length){ for(const [c,s] of PENDING_SALARY){ await setSalary(c,s); } PENDING_SALARY=[]; } render(); const created = qv('SELECT COUNT(*) FROM employees')-before; toast(`${kind==='ts'?'Timesheet':kind==='emp'?'Employee list':kind==='boq'?'BOQ complaints':kind==='reinst'?'Reinstatement jobs':kind==='rkpi'?'Reinstatement completions':'Daily cost report'}: ${rows} rows imported from ${list.length} file${list.length===1?'':'s'}${created?` · ${created} new employees created — set their salary`:''}${errs.length?` · ${errs.length} failed`:''}`, errs.length?'warn':'good'); });
       return;
     }
     const f = list[done++]; const reader = new FileReader();
@@ -3181,6 +3232,7 @@ function importFiles(files, kind){
                 unit:S(r['Unit']), building:S(r['Building']), road:S(r['Road']), block:S(g(r,'Block ','Block')), area:S(r['Area']), fault, pack:S(r['Pack']), price:N(r['Price']), add_pack:S(r['Multible']), add_price:N(r['Multible Amount']), dewatering:dew, tanker:tank, others}); rows++; });
           }
           else if(kind==='reinst'){ rows += importReinstatement(wb); }
+          else if(kind==='rkpi'){ rows += importReinstKpi(wb); }
           else if(kind==='dcr'){ // MAINTENANCE Daily Cost Report: Work + Manpower + Assets sheets
             const work = rowsOf(wb,'Work','Work Category')||[]; const dates=new Set(work.map(r=>xlDate(r['Date'])).filter(Boolean));
             dates.forEach(d=> run('DELETE FROM work_log WHERE date=? AND work_order<>"" AND work_order IN (SELECT work_order FROM work_log WHERE date=?)',[d,d]));
@@ -3212,12 +3264,13 @@ function importCardsHtml(){
     <div class="import-card" data-kind="ts"><div class="ic-head">${ICONS.clipboard}<b>Attendance timesheet</b></div><p>Overtime hours and food allowance per person. <span class="mono">History_YYYY-MM-DD_DEPOT_-_BUDAIYA.xlsx</span></p><button class="btn btn-primary" data-pick="ts">${ICONS.upload}Choose file(s)</button></div>
     <div class="import-card" data-kind="emp"><div class="ic-head">${ICONS.users}<b>Employee list</b></div><p>Roster with teams and salaries. <span class="mono">Budaiya_Employee.xlsx</span></p><button class="btn" data-pick="emp">${ICONS.upload}Choose file</button></div>
     <div class="import-card" data-kind="reinst"><div class="ic-head">${ICONS.tool}<b>Reinstatement cost report</b></div><p>Excavation reinstatements → jobs: Bricks / Concrete / Kerb → <b>Interlock</b> team, Asphalt → <b>Asphalt</b> team. <span class="mono">Reinstatement-Cost-Report-….xlsx</span></p><button class="btn btn-primary" data-pick="reinst">${ICONS.upload}Choose file(s)</button></div>
+    <div class="import-card" data-kind="rkpi"><div class="ic-head">${ICONS.check}<b>Reinstatement completed (KPI)</b></div><p>When each excavation was actually finished — the job moves to its completion date. <span class="mono">Reinstatement-Completed-KPI-….xlsx</span></p><button class="btn" data-pick="rkpi">${ICONS.upload}Choose file(s)</button></div>
     <div class="import-card" data-kind="dcr"><div class="ic-head">${ICONS.report}<b>Old daily cost report</b></div><p>Loads a hand-made report's Work, Manpower and Assets sheets. <span class="mono">…Daily_Cost_Report….xlsx</span></p><button class="btn" data-pick="dcr">${ICONS.upload}Choose file(s)</button></div>
   </div>
   <div class="dropzone" id="dropzone">${ICONS.upload}<div>…or drag files here — the type is detected from the file name</div></div>
   <input type="file" id="imp-file" accept=".xlsx,.xlsm,.xls" multiple style="display:none">`;
 }
-function detectKind(name){ const n=name.toLowerCase(); if(/reinstatement/.test(n)) return 'reinst'; if(/^boq/.test(n)) return 'boq'; if(/^history_/.test(n)) return 'ts'; if(/employee/.test(n)) return 'emp'; if(/cost_report|cost report/.test(n)) return 'dcr'; return null; }
+function detectKind(name){ const n=name.toLowerCase(); if(/reinstatement.*(kpi|completed)/.test(n)) return 'rkpi'; if(/reinstatement/.test(n)) return 'reinst'; if(/^boq/.test(n)) return 'boq'; if(/^history_/.test(n)) return 'ts'; if(/employee/.test(n)) return 'emp'; if(/cost_report|cost report/.test(n)) return 'dcr'; return null; }
 function wireImportCards(root){
   const inp = root.querySelector('#imp-file'); let kind=null;
   root.querySelectorAll('[data-pick]').forEach(b=> b.addEventListener('click', ()=>{ kind=b.dataset.pick; inp.multiple = kind!=='emp'; inp.click(); }));
@@ -3280,6 +3333,9 @@ function renderData(){
         <div class="field"><label>Charge basic salary for</label><select class="sel" data-set="charge_basic"><option value="attended" ${st('charge_basic')==='attended'?'selected':''}>days marked Working only</option><option value="all" ${st('charge_basic')==='all'?'selected':''}>every day in the timesheet</option></select></div>
         <div class="field"><label>Warn when out for more than (days)</label><input class="inp" data-set="overdue_days" type="number" value="${st('overdue_days')}"></div>
       </div>
+      <h4 style="margin:16px 0 6px">Reinstatement material costs (BD) — purchase price, used for profit &amp; loss on reinstatement jobs</h4>
+      <div class="modal-body" style="padding:0;grid-template-columns:repeat(4,1fr)">${REINST_MAT_KEYS.map(([k,l])=>`<div class="field"><label>${esc(l)}</label><input class="inp" data-mat="${k}" type="number" step="0.001" min="0" value="${matRates()[k]||''}"></div>`).join('')}</div>
+      <p class="field-note">The export only says “other colour” for non-yellow bricks, so those use the average of the Red / Black / Grey rates you set. Saving recalculates the material cost of every reinstatement job.</p>
       <div class="btn-row" style="margin-top:12px"><button class="btn" id="rate-day">Treat all hire rates as per day</button><button class="btn" id="rate-month">Treat all hire rates as per month</button></div>
       <p style="margin-top:8px">Hire rates entered on each vehicle / equipment have a "Rate is per" field; the two buttons change all of them at once.</p>
       <h3 class="sec">Start fresh</h3>
@@ -3333,6 +3389,7 @@ function renderData(){
   document.getElementById('db-forget').addEventListener('click', ()=>{ if(confirm('Sign this device out of the online database? Nothing is deleted.')) disconnectFile(); });
   wireImportCards(document.getElementById('data-import'));
   document.querySelectorAll('[data-set]').forEach(el=> el.addEventListener('change', async ()=>{ await mutate(()=> setSettingRaw(el.dataset.set, el.value)); toast('Setting saved','good'); }));
+  document.querySelectorAll('[data-mat]').forEach(el=> el.addEventListener('change', async ()=>{ const R=matRates(); R[el.dataset.mat]=Number(el.value)||0; await mutate(()=>{ setSettingRaw('reinst_mat_rates', JSON.stringify(R)); recomputeMaterialCosts(); }); toast('Material cost saved — reinstatement jobs recalculated','good'); }));
   document.querySelectorAll('[data-pw]').forEach(b=> b.addEventListener('click', async ()=>{ const p=prompt(`New password for ${b.dataset.pw}:`); if(!p) return; if(p.length<6){ toast('Use at least 6 characters','bad'); return; } await changePassword(b.dataset.pw, p); toast('Password changed','good'); }));
   const on=(id,ev,fn)=>{ const el=document.getElementById(id); if(el) el.addEventListener(ev,fn); };
   on('rate-day','click', async ()=>{ await mutate(()=>{ run("UPDATE vehicles SET rental_basis='day'"); run("UPDATE equipment SET rental_basis='day'"); }); toast('All hire rates are now per day','good'); });

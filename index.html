@@ -638,7 +638,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-03.4';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-03.5';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -788,6 +788,7 @@ function migrate(){
   { const tk=getSetting('tanker_team','Tanker'); const lines=String(getSetting('team_aliases','')).split(/\n/).filter(l=>l.trim() && !/^\s*[bi]\s*tanker\s*=/i.test(l)); lines.push('B Tanker = '+tk, 'I Tanker = '+tk); setSettingRaw('team_aliases', lines.join('\n')); }
   // v13: reinstatement tracking — payment stage, completion date (from the KPI export), material cost & quantities
   [['stage','TEXT'],['done_date','TEXT'],['mat_cost','REAL DEFAULT 0'],['reinst_q','TEXT']].forEach(([c,t])=>{ if(!hasColumn('work_log',c)) run(`ALTER TABLE work_log ADD COLUMN ${c} ${t}`); });
+  if(!hasColumn('employees','allowance')) run('ALTER TABLE employees ADD COLUMN allowance REAL DEFAULT 0');   // plaintext stays 0 — the value is encrypted in secure_salary (card#allow)
   run("CREATE TABLE IF NOT EXISTS reinst_done(exc TEXT PRIMARY KEY, complaint TEXT, type TEXT, start_at TEXT, end_at TEXT, within72 TEXT)");
   if(qv('SELECT COUNT(*) FROM settings WHERE key=?',['reinst_mat_rates'])===0) setSettingRaw('reinst_mat_rates', JSON.stringify(REINST_MAT_DEFAULT));
   // v11: richer maintenance records
@@ -1153,6 +1154,9 @@ async function setAllSalaries(value){
 }
 /* salary for one card — 0 unless the engineer is signed in */
 function salaryOf(cardNo){ return (CURRENT_USER && CURRENT_USER.role==='engineer' && SALARY[cardNo]!==undefined) ? SALARY[cardNo] : 0; }
+/* monthly allowance (encrypted like the salary, key card#allow) — charged per working day as allowance ÷ days per month */
+function allowanceOf(cardNo){ return salaryOf(cardNo+'#allow'); }
+async function setAllowance(cardNo, value){ return setSalary(cardNo+'#allow', value); }
 
 function can(perm){
   if(!CURRENT_USER) return false;
@@ -1278,11 +1282,13 @@ async function buildDailyCostReport(date){
   const eqs = q('SELECT * FROM equipment WHERE COALESCE(count_cost,1)=1 ORDER BY no').filter(a=>!PJ || (a.project||'')===PJ).map(a=>({...a, team:canon(a.team)}));
   const assets = [];
   const hctx = hireContext(date, date);
+  const elsewhere = [];   // assets of this depot that another project is using today — listed in the note, not counted
   const hireRow = (type, a, extra)=>{ const h = assetHireDay(hctx, type, a, date); const k=type+'|'+(type==='Vehicle'?a.vno:a.no);
+    const home = PJ || a.project || ''; if(home && h.project && h.project!==home){ elsewhere.push({ref:(type==='Vehicle'?a.vno:a.no), desc:extra.desc, project:h.project}); return null; }
     return Object.assign({team: canon(h.team||a.team||''), avail: h.hours>0 && h.rate>0, hours: h.hours, src: h.src,
       rateHr: h.hours>0 ? (h.basis==='hour' ? h.rate : h.cost/h.hours) : (h.basis==='hour' ? h.rate : 0), used: h.used, fuel: fuel[k]||0}, extra); };
-  eqs.forEach(a=> assets.push(hireRow('Equipment', a, {cls:assetClassOf('Equipment',a), desc:a.item, no:a.serial||a.no})));
-  vehs.forEach(a=> assets.push(hireRow('Vehicle', a, {cls:'Vehicle', desc:a.model||a.type||'', no:a.vno})));
+  eqs.forEach(a=>{ const r=hireRow('Equipment', a, {cls:assetClassOf('Equipment',a), desc:a.item, no:a.serial||a.no}); if(r) assets.push(r); });
+  vehs.forEach(a=>{ const r=hireRow('Vehicle', a, {cls:'Vehicle', desc:a.model||a.type||'', no:a.vno}); if(r) assets.push(r); });
   assets.sort((x,y)=> (x.cls==='Machinery'?0:x.cls==='Vehicle'?1:2)-(y.cls==='Machinery'?0:y.cls==='Vehicle'?1:2));
   const teams = [...new Set(emps.map(e=>e.team).concat(work.map(w=>w.team)).concat(assets.map(a=>a.team)).concat(work.some(w=>Number(w.tanker||0)+Number(w.dewatering||0)>0)?[canon(getSetting('tanker_team','Tanker'))]:[]).filter(Boolean))].sort();
 
@@ -1309,23 +1315,24 @@ async function buildDailyCostReport(date){
   /* ---------- Manpower ---------- */
   const wsM = wb.addWorksheet('Manpower', {views:[{state:'frozen', ySplit:4}]});
   wsM.getCell('B2').value='MANPOWER & LABOUR COST'; wsM.getCell('B2').font={bold:true,size:14};
-  wsM.getRow(4).values=['S/N','Card No.','Name','CPR','Actual Occupation','Team','Attendance','Monthly Salary (BD)','Daily Salary (BD)','OT Rate / Hr (BD)','OT Hours','OT Cost (BD)','Total Cost (BD)','Food Allowance (BD)','Remarks']; styleHeader(wsM.getRow(4),1,15); wsM.getRow(4).height=32;
-  [7.4,10,41.7,13,21.9,18.6,13,15,15,15,10,13,15,14,32].forEach((w,i)=>wsM.getColumn(i+1).width=w);
+  wsM.getRow(4).values=['S/N','Card No.','Name','CPR','Actual Occupation','Team','Attendance','Monthly Salary (BD)','Daily Salary (BD)','OT Rate / Hr (BD)','OT Hours','OT Cost (BD)','Total Cost (BD)','Food Allowance (BD)','Allowance / Day (BD)','Remarks']; styleHeader(wsM.getRow(4),1,16); wsM.getRow(4).height=32;
+  [7.4,10,41.7,13,21.9,18.6,13,15,15,15,10,13,15,14,14,32].forEach((w,i)=>wsM.getColumn(i+1).width=w);
   const mFirst=5, mLast=mFirst+Math.max(emps.length,1)-1, mTot=mLast+1;
   const foodRate=numSetting('food_rate',1), hasTs = Object.keys(att).length>0;
-  let manpowerTot=0, foodTotAll=0;
+  let manpowerTot=0, foodTotAll=0, allowTotAll=0;
   emps.forEach((e,i)=>{ const rn=mFirst+i; const a=att[e.card_no];
-    const status = a ? a.status : (hasTs ? 'Not on timesheet' : 'No timesheet');   // nobody is charged without a timesheet row
+    const status = a ? a.status : (hasTs ? 'Vacation' : 'No timesheet');   // in the roster but not on the day's timesheet = on vacation; nobody is charged without a timesheet row
     const ot = a ? Number(a.ot_hours||0) : 0; const foodN = a ? Number(a.food||0) : 0; const dayMult = (a && a.type_day && a.type_day!=='Normal') ? hmult : mult;
-    const daily=salaryOf(e.card_no)/dpm; const otRate=daily/hpd*dayMult; const foodCost=foodN*foodRate; const total = status==='Working' ? daily+otRate*ot+foodCost : 0; manpowerTot+=total; foodTotAll+= status==='Working'?foodCost:0;
-    const r=wsM.getRow(rn); r.values=[F('ROW()-4',i+1), e.card_no, e.name, e.cpr||'', e.occupation||'', e.team||'', status, salaryOf(e.card_no), F(`H${rn}/${dpm}`,daily), F(`I${rn}/${hpd}*${dayMult}`,otRate), ot, F(`J${rn}*K${rn}`,otRate*ot), F(`IF(G${rn}<>"Working",0,I${rn}+L${rn}+N${rn})`,total), F(`${foodN}*${foodRate}`,foodCost), a?(a.remarks||''):''];
-    [8,9,10,12,13,14].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(11).numFmt=RPT.hrs; zebra(r,1,15,i); });
-  const mt=wsM.getRow(mTot); mt.getCell(1).value='TOTAL'; mt.getCell(11).value=F(`SUM(K${mFirst}:K${mLast})`, emps.reduce((s,e)=>s+(att[e.card_no]?Number(att[e.card_no].ot_hours||0):0),0)); mt.getCell(12).value=F(`SUM(L${mFirst}:L${mLast})`,0); mt.getCell(13).value=F(`SUM(M${mFirst}:M${mLast})`,manpowerTot); mt.getCell(14).value=F(`SUM(N${mFirst}:N${mLast})`,foodTotAll); [11,12,13,14].forEach(c=>mt.getCell(c).numFmt=RPT.money); totalRow(mt,1,15);
+    const daily=salaryOf(e.card_no)/dpm, allowD=allowanceOf(e.card_no)/dpm; const otRate=daily/hpd*dayMult; const foodCost=foodN*foodRate; const total = status==='Working' ? daily+otRate*ot+foodCost+allowD : 0; manpowerTot+=total; foodTotAll+= status==='Working'?foodCost:0; allowTotAll+= status==='Working'?allowD:0;
+    const r=wsM.getRow(rn); r.values=[F('ROW()-4',i+1), e.card_no, e.name, e.cpr||'', e.occupation||'', e.team||'', status, salaryOf(e.card_no), F(`H${rn}/${dpm}`,daily), F(`I${rn}/${hpd}*${dayMult}`,otRate), ot, F(`J${rn}*K${rn}`,otRate*ot), F(`IF(G${rn}<>"Working",0,I${rn}+L${rn}+N${rn}+O${rn})`,total), F(`${foodN}*${foodRate}`,foodCost), F(`${allowanceOf(e.card_no)}/${dpm}`,allowD), a?(a.remarks||''):''];
+    [8,9,10,12,13,14,15].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(11).numFmt=RPT.hrs; zebra(r,1,16,i); });
+  const mt=wsM.getRow(mTot); mt.getCell(1).value='TOTAL'; mt.getCell(11).value=F(`SUM(K${mFirst}:K${mLast})`, emps.reduce((s,e)=>s+(att[e.card_no]?Number(att[e.card_no].ot_hours||0):0),0)); mt.getCell(12).value=F(`SUM(L${mFirst}:L${mLast})`,0); mt.getCell(13).value=F(`SUM(M${mFirst}:M${mLast})`,manpowerTot); mt.getCell(14).value=F(`SUM(N${mFirst}:N${mLast})`,foodTotAll); mt.getCell(15).value=F(`SUMIF(G${mFirst}:G${mLast},"Working",O${mFirst}:O${mLast})`,allowTotAll); [11,12,13,14,15].forEach(c=>mt.getCell(c).numFmt=RPT.money); totalRow(mt,1,16);
   const staffOnSite = emps.filter(e=> att[e.card_no] && att[e.card_no].status==='Working').length;
 
   /* ---------- Assets ---------- */
   const wsA = wb.addWorksheet('Assets', {views:[{state:'frozen', ySplit:4}]});
   wsA.getCell('B2').value='ASSET REGISTER'; wsA.getCell('B2').font={bold:true,size:14};
+  if(elsewhere.length){ wsA.getCell('B3').value='Not counted today (used by another project): '+elsewhere.map(x=>`${x.ref} ${x.desc||''} → ${x.project}`).join(' · '); wsA.getCell('B3').font={italic:true,size:9,color:{argb:'FF666666'}}; }
   wsA.getRow(4).values=['S/N','Asset Class','Section ','Asset / Description','Vehicle No.','Assigned To Team','Available Today','Hire Rate (BD/Hr)','Duty Hours','Hire Charged (BD)','Used Today','Hours Used','Utilisation %','Idle Hire Cost (BD)','Fuel (BD)','Total Charge (BD)']; styleHeader(wsA.getRow(4),1,16); wsA.getRow(4).height=32;
   [5,18,18,40.9,17.7,17,13,14,13,14,11,12,12,15,11,14].forEach((w,i)=>wsA.getColumn(i+1).width=w);
   const aFirst=5, aLast=aFirst+Math.max(assets.length,1)-1, aTot=aLast+1;
@@ -1341,33 +1348,37 @@ async function buildDailyCostReport(date){
     wsR.getCell('B3').value=`${site} · ${excelDate(date).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric',timeZone:'UTC'})} — Interlock & concrete → Interlock team · Asphalt → Asphalt team`; wsR.getCell('B3').font={italic:true,size:9,color:{argb:'FF666666'}};
     const rj = work.filter(w=>w.category==='Reinstatement').map(w=>{ let qy={}; try{ qy=JSON.parse(w.reinst_q||'{}')||{}; }catch(e){} return {...w, qy}; });
     const RM = matRates();
-    wsR.getRow(4).values=['S/N','Excavation No.','Complaint','Type','Team','Location','Area (m²)','60mm Yellow (pcs)','60mm Other (pcs)','80mm Yellow (pcs)','80mm Other (pcs)','New Kerbs (pcs)','Old Kerbs (pcs)','Concrete (m³)','Asphalt (m³)','Road Base (m³)','Work Done (BD)','Material Cost (BD)','Net (BD)','Margin %','Status','Completed On','','Unit cost','BD'];
-    styleHeader(wsR.getRow(4),1,22); wsR.getRow(4).height=32; styleHeader(wsR.getRow(4),24,25);
-    [5,14,13,11,12,34,9,9,9,9,9,8,8,9,9,9,13,13,13,9,16,12,3,26,10].forEach((w,i)=>wsR.getColumn(i+1).width=w);
-    // unit-cost block (X5:Y12) — the material formulas point here so the engineer can test other prices
+    const RH=['S/N','Excavation No.','Complaint','Type','Team','Area','Building','Road','Block','Area (m²)','60mm Yellow (pcs)','60mm Other (pcs)','80mm Yellow (pcs)','80mm Other (pcs)','New Kerbs (pcs)','Old Kerbs (pcs)','Concrete (m³)','Asphalt (m³)','Road Base (m³)','Work Done (BD)','Material Cost (BD)','Net (BD)','Margin %','Status','Completed On'];
+    const RC = RH.length;                                     // 25 data columns (A..Y); unit-cost block two columns to the right
+    const CL = n=>{ let t=''; while(n>0){ const m=(n-1)%26; t=String.fromCharCode(65+m)+t; n=Math.floor((n-1)/26); } return t; };
+    const col = name=> CL(RH.indexOf(name)+1);
+    const cA=col('Area (m²)'), cY60=col('60mm Yellow (pcs)'), cO60=col('60mm Other (pcs)'), cY80=col('80mm Yellow (pcs)'), cO80=col('80mm Other (pcs)'), cKN=col('New Kerbs (pcs)'), cKO=col('Old Kerbs (pcs)'), cCo=col('Concrete (m³)'), cAs=col('Asphalt (m³)'), cRb=col('Road Base (m³)'), cW=col('Work Done (BD)'), cM=col('Material Cost (BD)'), cN=col('Net (BD)'), cP=col('Margin %'), cS=col('Status'), cD=col('Completed On'), cT=col('Team');
+    const rateCol=RC+2, rateL=CL(rateCol+1);
+    wsR.getRow(4).values=RH.concat(['','Unit cost','BD']); styleHeader(wsR.getRow(4),1,RC); wsR.getRow(4).height=32; styleHeader(wsR.getRow(4),rateCol,rateCol+1);
+    [5,14,13,11,12,20,9,8,8,9,9,9,9,9,8,8,9,9,9,13,13,13,9,16,12,3,30,10].forEach((w,i)=>wsR.getColumn(i+1).width=w);
     const rateRows=[['60mm Yellow brick (per piece)','b60_yellow'],['60mm Other colour brick (per piece)','b60_other'],['80mm Yellow brick (per piece)','b80_yellow'],['80mm Other colour brick (per piece)','b80_other'],['Kerb stone (per piece)','kerb'],['Concrete (per m³)','concrete'],['Asphalt (per m³)','asphalt'],['Road base (per m³)','roadbase']];
-    rateRows.forEach(([l,k],i)=>{ const r=wsR.getRow(5+i); r.getCell(24).value=l; r.getCell(25).value=Number(RM[k])||0; r.getCell(25).numFmt=RPT.money; zebra(r,24,25,i); });
+    rateRows.forEach(([l,k],i)=>{ const r=wsR.getRow(5+i); r.getCell(rateCol).value=l; r.getCell(rateCol+1).value=Number(RM[k])||0; r.getCell(rateCol+1).numFmt=RPT.money; zebra(r,rateCol,rateCol+1,i); });
     const rFirst=5, rLast=rFirst+Math.max(rj.length,1)-1, rTot=rLast+1;
-    const rate=k=>`$Y$${5+rateRows.findIndex(x=>x[1]===k)}`;
+    const rate=k=>`$${rateL}$${5+rateRows.findIndex(x=>x[1]===k)}`;
     rj.forEach((w,i)=>{ const rn=rFirst+i, Q=w.qy, mat=Number(w.mat_cost||0), amt=Number(w.amount||0);
-      const matF=`H${rn}*${rate('b60_yellow')}+I${rn}*${rate('b60_other')}+J${rn}*${rate('b80_yellow')}+K${rn}*${rate('b80_other')}+(L${rn}+M${rn})*${rate('kerb')}+N${rn}*${rate('concrete')}+O${rn}*${rate('asphalt')}+P${rn}*${rate('roadbase')}`;
-      const r=wsR.getRow(rn); r.values=[F('ROW()-4',i+1), w.work_order||'', String(w.materials||'').replace(/^Complaint\s*/i,''), Q.type||String(w.fault||'').replace(/ reinstatement$/i,''), w.team||'', w.location||'', Number(Q.area||0), Number(Q.y60||0), Number(Q.o60||0), Number(Q.y80||0), Number(Q.o80||0), Number(Q.kerbNew||0), Number(Q.kerbOld||0), Number(Q.conc_m3||0), Number(Q.asph_m3||0), Number(Q.rb_m3||0), amt, F(matF,mat), F(`Q${rn}-R${rn}`,amt-mat), F(`IFERROR(S${rn}/Q${rn},"")`,amt?(amt-mat)/amt:''), w.stage||(w.status==='Completed'?'Completed':''), w.done_date?excelDate(w.done_date):''];
-      [7,14,15,16].forEach(c=>r.getCell(c).numFmt='#,##0.00'); [17,18,19].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(20).numFmt=RPT.pct; r.getCell(22).numFmt=RPT.date; zebra(r,1,22,i); });
-    if(!rj.length){ const r=wsR.getRow(rFirst); r.getCell(1).value=1; r.getCell(2).value='No reinstatement work on this date'; [17,18,19].forEach(c=>r.getCell(c).value=0); zebra(r,1,22,0); }
-    const rt=wsR.getRow(rTot); rt.getCell(1).value='TOTAL'; const sumCols={7:'area',8:'y60',9:'o60',10:'y80',11:'o80',12:'kerbNew',13:'kerbOld',14:'conc_m3',15:'asph_m3',16:'rb_m3'};
-    Object.entries(sumCols).forEach(([c,k])=>{ const L=String.fromCharCode(64+Number(c)); rt.getCell(Number(c)).value=F(`SUM(${L}${rFirst}:${L}${rLast})`, rj.reduce((s,w)=>s+Number(w.qy[k]||0),0)); rt.getCell(Number(c)).numFmt='#,##0.00'; });
+      const matF=`${cY60}${rn}*${rate('b60_yellow')}+${cO60}${rn}*${rate('b60_other')}+${cY80}${rn}*${rate('b80_yellow')}+${cO80}${rn}*${rate('b80_other')}+(${cKN}${rn}+${cKO}${rn})*${rate('kerb')}+${cCo}${rn}*${rate('concrete')}+${cAs}${rn}*${rate('asphalt')}+${cRb}${rn}*${rate('roadbase')}`;
+      const r=wsR.getRow(rn); r.values=[F('ROW()-4',i+1), w.work_order||'', String(w.materials||'').replace(/^Complaint\s*/i,''), Q.type||String(w.fault||'').replace(/ reinstatement$/i,''), w.team||'', w.area||'', w.unit||w.building||'', w.road||'', w.block||'', Number(Q.area||0), Number(Q.y60||0), Number(Q.o60||0), Number(Q.y80||0), Number(Q.o80||0), Number(Q.kerbNew||0), Number(Q.kerbOld||0), Number(Q.conc_m3||0), Number(Q.asph_m3||0), Number(Q.rb_m3||0), amt, F(matF,mat), F(`${cW}${rn}-${cM}${rn}`,amt-mat), F(`IFERROR(${cN}${rn}/${cW}${rn},"")`,amt?(amt-mat)/amt:''), w.stage||(w.status==='Completed'?'Completed':''), w.done_date?excelDate(w.done_date):''];
+      [cA,cCo,cAs,cRb].forEach(c=>r.getCell(c).numFmt='#,##0.00'); [cW,cM,cN].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(cP).numFmt=RPT.pct; r.getCell(cD).numFmt=RPT.date; zebra(r,1,RC,i); });
+    if(!rj.length){ const r=wsR.getRow(rFirst); r.getCell(1).value=1; r.getCell(2).value='No reinstatement work on this date'; [cW,cM,cN].forEach(c=>r.getCell(c).value=0); zebra(r,1,RC,0); }
+    const rt=wsR.getRow(rTot); rt.getCell(1).value='TOTAL'; const sumCols=[[cA,'area'],[cY60,'y60'],[cO60,'o60'],[cY80,'y80'],[cO80,'o80'],[cKN,'kerbNew'],[cKO,'kerbOld'],[cCo,'conc_m3'],[cAs,'asph_m3'],[cRb,'rb_m3']];
+    sumCols.forEach(([L,k])=>{ rt.getCell(L).value=F(`SUM(${L}${rFirst}:${L}${rLast})`, rj.reduce((s,w)=>s+Number(w.qy[k]||0),0)); rt.getCell(L).numFmt='#,##0.00'; });
     const rAmt=rj.reduce((s,w)=>s+Number(w.amount||0),0), rMat=rj.reduce((s,w)=>s+Number(w.mat_cost||0),0);
-    rt.getCell(17).value=F(`SUM(Q${rFirst}:Q${rLast})`,rAmt); rt.getCell(18).value=F(`SUM(R${rFirst}:R${rLast})`,rMat); rt.getCell(19).value=F(`Q${rTot}-R${rTot}`,rAmt-rMat); rt.getCell(20).value=F(`IFERROR(S${rTot}/Q${rTot},"")`,rAmt?(rAmt-rMat)/rAmt:''); [17,18,19].forEach(c=>rt.getCell(c).numFmt=RPT.money); rt.getCell(20).numFmt=RPT.pct; totalRow(rt,1,22);
+    rt.getCell(cW).value=F(`SUM(${cW}${rFirst}:${cW}${rLast})`,rAmt); rt.getCell(cM).value=F(`SUM(${cM}${rFirst}:${cM}${rLast})`,rMat); rt.getCell(cN).value=F(`${cW}${rTot}-${cM}${rTot}`,rAmt-rMat); rt.getCell(cP).value=F(`IFERROR(${cN}${rTot}/${cW}${rTot},"")`,rAmt?(rAmt-rMat)/rAmt:''); [cW,cM,cN].forEach(c=>rt.getCell(c).numFmt=RPT.money); rt.getCell(cP).numFmt=RPT.pct; totalRow(rt,1,RC);
     // by team
     let bn=rTot+3; band(wsR,`B${bn}:I${bn}`,'REINSTATEMENT BY TEAM'); bn++;
     wsR.getRow(bn).values=['','Team','Jobs','Work Done (BD)','Material Cost (BD)','Net (BD)','Margin %','Completed','Waiting Payment']; styleHeader(wsR.getRow(bn),2,9); bn++;
     const rTeams=[...new Set(rj.map(w=>w.team).filter(Boolean))]; if(!rTeams.length) rTeams.push(canon('Interlock'), canon('Asphalt'));
-    const bFirst=bn;
+    const bFirst=bn, TR=`$${cT}$${rFirst}:$${cT}$${rLast}`, WR=`$${cW}$${rFirst}:$${cW}$${rLast}`, MR=`$${cM}$${rFirst}:$${cM}$${rLast}`, SR=`$${cS}$${rFirst}:$${cS}$${rLast}`;
     rTeams.forEach((t,i)=>{ const jobs=rj.filter(w=>w.team===t), a=jobs.reduce((s,w)=>s+Number(w.amount||0),0), m=jobs.reduce((s,w)=>s+Number(w.mat_cost||0),0);
-      const r=wsR.getRow(bn); r.values=['',t, F(`COUNTIF($E$${rFirst}:$E$${rLast},B${bn})`,jobs.length), F(`SUMIF($E$${rFirst}:$E$${rLast},B${bn},$Q$${rFirst}:$Q$${rLast})`,a), F(`SUMIF($E$${rFirst}:$E$${rLast},B${bn},$R$${rFirst}:$R$${rLast})`,m), F(`D${bn}-E${bn}`,a-m), F(`IFERROR(F${bn}/D${bn},"")`,a?(a-m)/a:''), F(`COUNTIFS($E$${rFirst}:$E$${rLast},B${bn},$U$${rFirst}:$U$${rLast},"Completed")`,jobs.filter(w=>/^completed$/i.test(w.stage||'')).length), F(`COUNTIFS($E$${rFirst}:$E$${rLast},B${bn},$U$${rFirst}:$U$${rLast},"Waiting Payment")`,jobs.filter(w=>/waiting/i.test(w.stage||'')).length)];
+      const r=wsR.getRow(bn); r.values=['',t, F(`COUNTIF(${TR},B${bn})`,jobs.length), F(`SUMIF(${TR},B${bn},${WR})`,a), F(`SUMIF(${TR},B${bn},${MR})`,m), F(`D${bn}-E${bn}`,a-m), F(`IFERROR(F${bn}/D${bn},"")`,a?(a-m)/a:''), F(`COUNTIFS(${TR},B${bn},${SR},"Completed")`,jobs.filter(w=>/^completed$/i.test(w.stage||'')).length), F(`COUNTIFS(${TR},B${bn},${SR},"Waiting Payment")`,jobs.filter(w=>/waiting/i.test(w.stage||'')).length)];
       [4,5,6].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(7).numFmt=RPT.pct; zebra(r,2,9,i); bn++; });
     { const r=wsR.getRow(bn); r.values=['','TOTAL', F(`SUM(C${bFirst}:C${bn-1})`,rj.length), F(`SUM(D${bFirst}:D${bn-1})`,rAmt), F(`SUM(E${bFirst}:E${bn-1})`,rMat), F(`D${bn}-E${bn}`,rAmt-rMat), F(`IFERROR(F${bn}/D${bn},"")`,rAmt?(rAmt-rMat)/rAmt:''), F(`SUM(H${bFirst}:H${bn-1})`,rj.filter(w=>/^completed$/i.test(w.stage||'')).length), F(`SUM(I${bFirst}:I${bn-1})`,rj.filter(w=>/waiting/i.test(w.stage||'')).length)]; [4,5,6].forEach(c=>r.getCell(c).numFmt=RPT.money); r.getCell(7).numFmt=RPT.pct; totalRow(r,2,9); }
-    wsR.autoFilter={from:{row:4,column:1},to:{row:4,column:22}};
+    wsR.autoFilter={from:{row:4,column:1},to:{row:4,column:RC}};
   }
 
   /* ---------- Lists ---------- */
@@ -1419,7 +1430,7 @@ async function buildDailyCostReport(date){
   let rn=26; const tFirst=rn;
   const tankerTeam = canon(getSetting('tanker_team','Tanker')), isTk = t=> String(t||'').toLowerCase()===tankerTeam.toLowerCase();
   const tkAmt = w=> Number(w.tanker||0)+Number(w.dewatering||0);
-  const teamStats = t=>{ const jobs=work.filter(w=>w.team===t); const wd=jobs.reduce((s,w)=>s+Number(w.amount||0)-(isTk(t)?0:tkAmt(w)),0) + (isTk(t)? work.filter(w=>!isTk(w.team)).reduce((s,w)=>s+tkAmt(w),0) : 0); const mp=emps.filter(e=>e.team===t).reduce((s,e)=>{ const a=att[e.card_no]; if(!a||a.status!=='Working') return s; const d=salaryOf(e.card_no)/dpm; const dm=(a.type_day&&a.type_day!=='Normal')?hmult:mult; return s+d+d/hpd*dm*Number(a.ot_hours||0)+Number(a.food||0)*foodRate; },0); const as=assets.filter(a=>a.team===t).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0) + jobs.reduce((s,w)=>s+Number(w.mat_cost||0),0); return {jobs:jobs.length, wd, mp, as}; };
+  const teamStats = t=>{ const jobs=work.filter(w=>w.team===t); const wd=jobs.reduce((s,w)=>s+Number(w.amount||0)-(isTk(t)?0:tkAmt(w)),0) + (isTk(t)? work.filter(w=>!isTk(w.team)).reduce((s,w)=>s+tkAmt(w),0) : 0); const mp=emps.filter(e=>e.team===t).reduce((s,e)=>{ const a=att[e.card_no]; if(!a||a.status!=='Working') return s; const d=salaryOf(e.card_no)/dpm; const dm=(a.type_day&&a.type_day!=='Normal')?hmult:mult; return s+d+allowanceOf(e.card_no)/dpm+d/hpd*dm*Number(a.ot_hours||0)+Number(a.food||0)*foodRate; },0); const as=assets.filter(a=>a.team===t).reduce((s,a)=>s+(a.avail?a.rateHr*a.hours:0)+a.fuel,0) + jobs.reduce((s,w)=>s+Number(w.mat_cost||0),0); return {jobs:jobs.length, wd, mp, as}; };
   teams.forEach((t,i)=>{ const r=ws.getRow(rn); const s=teamStats(t);
     const wdF = `SUMIFS('Work-1'!$X$${wFirst}:$X$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})-SUMIFS('Work-1'!$S$${wFirst}:$S$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})-SUMIFS('Work-1'!$T$${wFirst}:$T$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})` + (isTk(t)? `+SUM('Work-1'!$S$${wFirst}:$T$${wLast})` : '');
     r.values=['',t, F(`COUNTIFS('Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.jobs), F(wdF,s.wd), F(`SUMIFS(Manpower!$M$${mFirst}:$M$${mLast},Manpower!$F$${mFirst}:$F$${mLast},$B${rn})`,s.mp), F(`SUMIFS(Assets!$P$${aFirst}:$P$${aLast},Assets!$F$${aFirst}:$F$${aLast},$B${rn})+SUMIFS('Work-1'!$AA$${wFirst}:$AA$${wLast},'Work-1'!$D$${wFirst}:$D$${wLast},$B${rn})`,s.as), F(`E${rn}+F${rn}`,s.mp+s.as), F(`D${rn}-G${rn}`,s.wd-s.mp-s.as), F(`IFERROR(H${rn}/D${rn},"")`, s.wd?(s.wd-s.mp-s.as)/s.wd:'')];
@@ -1772,6 +1783,7 @@ const ENTITIES = {
       PROJECT_COL,
       {key:'timing', label:'Shift start', type:'time', w:90},
       {key:'basic_salary', label:'Basic salary / month', type:'money', w:140, num:true, computed:true, salary:true, hint:'Encrypted — stored so only the engineer password can read it. Daily = basic ÷ days per month.'},
+      {key:'allowance', label:'Allowance / month', type:'money', w:130, num:true, computed:true, salary:true, allow:true, hint:'Encrypted like the salary. Charged on working days as allowance ÷ days per month, on top of daily salary, OT and food.'},
       {key:'status', label:'Status', type:'select', options:['Active','Vacation','Left'], badge:true, w:100},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
     ],
@@ -2091,7 +2103,7 @@ function badgeTone(key, col, val){
 function cellHtml(key, c, r){
   let v = r[c.key];
   if(c.type==='toggle'){ const on = Number(v)!==0; const what = c.key==='count_util' ? 'utilisation' : 'cost'; return `<button class="pill-toggle ${on?'on':'off'}" data-act="toggle" data-id="${r.id}" data-col="${c.key}" title="${on?'Counted in '+what+' — click to exclude':'Excluded from '+what+' — click to include'}"><span class="dot"></span>${on?'On':'Off'}</button>`; }
-  if(c.salary){ const s=salaryOf(r.card_no); return s ? `<span class="mono">${money(s)}</span>` : `<span class="muted">—</span>`; }
+  if(c.salary){ const s=(c.allow?allowanceOf:salaryOf)(r.card_no); return s ? `<span class="mono">${money(s)}</span>` : `<span class="muted">—</span>`; }
   if(key==='vehicles' && c.key==='driver'){
     const live = qv(`SELECT driver FROM vehicle_moves WHERE vno=? AND (return_date IS NULL OR return_date='') ORDER BY date_out DESC, id DESC LIMIT 1`,[r.vno]);
     if(live) return `${esc(live)} <span class="badge info" style="font-size:10px;padding:1px 6px" title="Current driver from the open movement in Vehicle log"><span class="dot"></span>now</span>`;
@@ -2219,7 +2231,7 @@ function openForm(key, id, presets){
   const isEdit = !!rec;
   const cols = cfg.columns.filter(c=> (!c.computed || c.salary) && (can('salary') || !c.salary));
   const vals = {};
-  cols.forEach(c=>{ vals[c.key] = rec ? (rec[c.key] ?? '') : (presets&&presets[c.key]!==undefined ? presets[c.key] : (c.default ? c.default() : '')); if(c.salary && rec) vals[c.key] = salaryOf(rec.card_no)||''; if(c.display && vals[c.key]) vals[c.key] = c.display(rec||Object.assign({},presets||{},vals)); });
+  cols.forEach(c=>{ vals[c.key] = rec ? (rec[c.key] ?? '') : (presets&&presets[c.key]!==undefined ? presets[c.key] : (c.default ? c.default() : '')); if(c.salary && rec) vals[c.key] = (c.allow?allowanceOf:salaryOf)(rec.card_no)||''; if(c.display && vals[c.key]) vals[c.key] = c.display(rec||Object.assign({},presets||{},vals)); });
   // stock item preset: fill unit cost hint
   let fields = ''; let lastSection = null;
   cols.forEach(c=>{
@@ -2293,7 +2305,7 @@ function openForm(key, id, presets){
         if(key==='maintenance'||(key==='expenses'&&data.asset_ref)){ data.asset_name = assetName(data.asset_type, data.asset_ref); if(key==='expenses') delete data.asset_name; }
         if(key==='attendance' && !data.name){ const e=q1('SELECT name FROM employees WHERE card_no=?',[data.card_no]); if(e) data.name=e.name; }
         if(key==='vehicle_moves' && !data.driver && data.cpr){ const d=q1('SELECT name FROM drivers WHERE cpr=?',[data.cpr]); if(d) data.driver=d.name; }
-        if(key==='employees') data.basic_salary = 0;   // never store plaintext salary
+        if(key==='employees'){ data.basic_salary = 0; data.allowance = 0; }   // never store plaintext salary / allowance
         if(isEdit) updateRow(cfg.table, id, data); else insertRow(cfg.table, data);
         if(key==='items'){ run('UPDATE items SET current=start_qty+qty_in-qty_out WHERE id=?',[isEdit?id:qv('SELECT last_insert_rowid()')]); }
       });
@@ -2301,7 +2313,7 @@ function openForm(key, id, presets){
       const msg = /UNIQUE/.test(e.message) ? 'A record with that key already exists (duplicate name / number / date)' : 'Could not save: '+e.message;
       toast(msg, 'bad'); return;
     }
-    if(key==='employees' && CURRENT_USER && CURRENT_USER.role==='engineer'){ const sc=cols.find(x=>x.salary); if(sc){ await setSalary(data.card_no, Number(document.getElementById('f-basic_salary')?.value)||0); } }
+    if(key==='employees' && CURRENT_USER && CURRENT_USER.role==='engineer'){ const sc=cols.find(x=>x.salary); if(sc){ await setSalary(data.card_no, Number(document.getElementById('f-basic_salary')?.value)||0); } const al=document.getElementById('f-allowance'); if(al) await setAllowance(data.card_no, Number(al.value)||0); }
     close();
     toast(isEdit ? 'Changes saved' : `${cfg.singular} added`, 'good');
     render();
@@ -2569,8 +2581,8 @@ function costSummary(from, to, opts){
       SUM(a.food) food_n
       FROM attendance a LEFT JOIN employees e ON e.card_no=a.card_no WHERE a.date>=? AND a.date<=? AND (?='' OR COALESCE(e.project,'')=?) GROUP BY a.card_no ORDER BY team, name`,[chargeAll?1:0, mult, hmult, from, to, PJ, PJ]);
   labor.forEach(r=>{ r.project = (q1('SELECT project FROM employees WHERE card_no=?',[r.card_no])||{}).project||''; });
-  labor.forEach(r=>{ r.basic = salaryOf(r.card_no); r.team = canon(r.team)||'Unassigned'; r.daily = r.basic/dpm; r.ot_rate = r.daily/hpd*mult; r.basic_cost = r.days_worked*r.daily; r.ot_cost = r.ot_hours_w*r.daily/hpd; r.food_cost = r.food_n*food; r.total = r.basic_cost+r.ot_cost+r.food_cost; });
-  const laborTot = { basic:labor.reduce((s,r)=>s+r.basic_cost,0), ot:labor.reduce((s,r)=>s+r.ot_cost,0), food:labor.reduce((s,r)=>s+r.food_cost,0), ot_hours:labor.reduce((s,r)=>s+r.ot_hours,0), staff:labor.filter(r=>r.days_worked>0).length };
+  labor.forEach(r=>{ r.basic = salaryOf(r.card_no); r.team = canon(r.team)||'Unassigned'; r.daily = r.basic/dpm; r.ot_rate = r.daily/hpd*mult; r.basic_cost = r.days_worked*r.daily; r.ot_cost = r.ot_hours_w*r.daily/hpd; r.food_cost = r.food_n*food; r.allow = allowanceOf(r.card_no); r.allow_daily = r.allow/dpm; r.allow_cost = r.days_worked*r.allow_daily; r.total = r.basic_cost+r.ot_cost+r.food_cost+r.allow_cost; });
+  const laborTot = { basic:labor.reduce((s,r)=>s+r.basic_cost,0), ot:labor.reduce((s,r)=>s+r.ot_cost,0), food:labor.reduce((s,r)=>s+r.food_cost,0), allow:labor.reduce((s,r)=>s+r.allow_cost,0), ot_hours:labor.reduce((s,r)=>s+r.ot_hours,0), staff:labor.filter(r=>r.days_worked>0).length };
   laborTot.total = laborTot.basic+laborTot.ot+laborTot.food;
   // asset hire — only on active depot days
   const active = activeDaysInPeriod(from, to);
@@ -2805,7 +2817,7 @@ function renderCost(){
       <div class="panel"><div class="panel-head"><h3>Work done by category</h3><span class="tag">${s.work.jobs} jobs</span></div><div class="panel-body">${s.workByCat.length?`<table class="plain"><thead><tr><th>Category</th><th class="num">Jobs</th><th class="num">Done</th><th class="num">Amount</th><th class="num">%</th></tr></thead><tbody>${s.workByCat.map(r=>`<tr><td>${esc(r.category)}</td><td class="num mono">${r.jobs}</td><td class="num mono">${r.done}</td><td class="num mono">${money(r.amount)}</td><td class="num mono">${s.work.total?Math.round(r.amount/s.work.total*100):0}%</td></tr>`).join('')}</tbody></table>`:`<div class="empty-row">No jobs logged. Use "Log job" or import the Work sheet of a daily cost report.</div>`}</div></div>
       <div class="panel"><div class="panel-head"><h3>Fuel & expenses</h3><span class="tag">${money(s.expTot)}</span></div><div class="panel-body">${s.expByCat.length?`<table class="plain"><thead><tr><th>Category</th><th class="num">Entries</th><th class="num">Amount</th></tr></thead><tbody>${s.expByCat.map(r=>`<tr><td>${esc(r.category)}</td><td class="num mono">${r.n}</td><td class="num mono">${money(r.amount)}</td></tr>`).join('')}</tbody></table>`:`<div class="empty-row">No fuel or expenses logged in this period.</div>`}</div></div>
     </div>
-    ${can('salary')?`<div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Manpower detail</h3><span class="tag">daily = basic ÷ ${numSetting('days_per_month',30)} · OT = daily ÷ ${numSetting('hours_per_day',8)} × ${numSetting('ot_multiplier',1.25)} · food ${money(numSetting('food_rate',1))}</span></div><div class="panel-body">${s.labor.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Card</th><th>Name</th><th>Team</th><th>Occupation</th><th class="num">Days</th><th class="num">Hours</th><th class="num">Daily</th><th class="num">Basic</th><th class="num">OT hrs</th><th class="num">OT rate</th><th class="num">OT cost</th><th class="num">Food</th><th class="num">Total</th></tr></thead><tbody>${s.labor.map(r=>`<tr><td class="mono">${esc(r.card_no)}</td><td>${esc(r.name)}${r.basic?'':' <span class="badge warn">no salary</span>'}</td><td>${esc(r.team)}</td><td>${esc(r.occupation||'')}</td><td class="num mono">${r.days_worked}/${r.days_logged}</td><td class="num mono">${num(r.hours)}</td><td class="num mono">${money(r.daily)}</td><td class="num mono">${money(r.basic_cost)}</td><td class="num mono">${num(r.ot_hours)}</td><td class="num mono">${money(r.ot_rate)}</td><td class="num mono">${money(r.ot_cost)}</td><td class="num mono">${money(r.food_cost)}</td><td class="num mono">${money(r.total)}</td></tr>`).join('')}</tbody><tfoot><tr><td colspan="7">Total</td><td class="num mono">${money(s.laborTot.basic)}</td><td class="num mono">${num(s.laborTot.ot_hours)}</td><td></td><td class="num mono">${money(s.laborTot.ot)}</td><td class="num mono">${money(s.laborTot.food)}</td><td class="num mono">${money(s.laborTot.total)}</td></tr></tfoot></table></div>`:`<div class="empty-row">No timesheet rows in this period.</div>`}</div></div>`:''}
+    ${can('salary')?`<div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Manpower detail</h3><span class="tag">daily = basic ÷ ${numSetting('days_per_month',30)} · OT = daily ÷ ${numSetting('hours_per_day',8)} × ${numSetting('ot_multiplier',1.25)} · food ${money(numSetting('food_rate',1))}</span></div><div class="panel-body">${s.labor.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Card</th><th>Name</th><th>Team</th><th>Occupation</th><th class="num">Days</th><th class="num">Hours</th><th class="num">Daily</th><th class="num">Basic</th><th class="num">OT hrs</th><th class="num">OT rate</th><th class="num">OT cost</th><th class="num">Food</th><th class="num">Allowance</th><th class="num">Total</th></tr></thead><tbody>${s.labor.map(r=>`<tr><td class="mono">${esc(r.card_no)}</td><td>${esc(r.name)}${r.basic?'':' <span class="badge warn">no salary</span>'}</td><td>${esc(r.team)}</td><td>${esc(r.occupation||'')}</td><td class="num mono">${r.days_worked}/${r.days_logged}</td><td class="num mono">${num(r.hours)}</td><td class="num mono">${money(r.daily)}</td><td class="num mono">${money(r.basic_cost)}</td><td class="num mono">${num(r.ot_hours)}</td><td class="num mono">${money(r.ot_rate)}</td><td class="num mono">${money(r.ot_cost)}</td><td class="num mono">${money(r.food_cost)}</td><td class="num mono">${money(r.allow_cost)}</td><td class="num mono">${money(r.total)}</td></tr>`).join('')}</tbody><tfoot><tr><td colspan="7">Total</td><td class="num mono">${money(s.laborTot.basic)}</td><td class="num mono">${num(s.laborTot.ot_hours)}</td><td></td><td class="num mono">${money(s.laborTot.ot)}</td><td class="num mono">${money(s.laborTot.food)}</td><td class="num mono">${money(s.laborTot.allow)}</td><td class="num mono">${money(s.laborTot.total)}</td></tr></tfoot></table></div>`:`<div class="empty-row">No timesheet rows in this period.</div>`}</div></div>`:''}
     <div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Vehicle hire & utilisation</h3><span class="tag">click a row for history</span></div><div class="panel-body">${hireTable(s.veh,true)}</div></div>
     <div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Equipment hire & utilisation</h3></div><div class="panel-body">${hireTable(s.eq,false)}</div></div>
     <div class="panel" style="margin-bottom:14px"><div class="panel-head"><h3>Stock purchases (received)</h3><span class="tag">qty × unit cost</span></div><div class="panel-body">${s.purchases.length?`<div class="scroll-x"><table class="plain"><thead><tr><th>Item</th><th class="num">Qty received</th><th class="num">Cost (BD)</th></tr></thead><tbody>${s.purchases.map(p=>`<tr><td>${esc(p.name)}</td><td class="num mono">${num(p.qty)}</td><td class="num mono">${money(p.cost)}</td></tr>`).join('')}</tbody><tfoot><tr><td colspan="2">Total</td><td class="num mono">${money(s.purchTot)}</td></tr></tfoot></table></div>`:`<div class="empty-row">No stock received in this period.</div>`}</div></div>`;
@@ -2879,17 +2891,17 @@ async function exportCostReport(s, label){
 
   /* ---------- Manpower ---------- */
   const otSplit = {}; q(`SELECT card_no, SUM(CASE WHEN status='Working' AND (type_day IS NULL OR type_day='' OR type_day='Normal') THEN COALESCE(ot_hours,0) ELSE 0 END) otn, SUM(CASE WHEN status='Working' AND NOT (type_day IS NULL OR type_day='' OR type_day='Normal') THEN COALESCE(ot_hours,0) ELSE 0 END) oth FROM attendance WHERE date>=? AND date<=? GROUP BY card_no`,[s.from,s.to]).forEach(r=> otSplit[r.card_no]=r);
-  const wsM = sheet('Manpower','MANPOWER & LABOUR COST',subLine+' · salaries are confidential',[7,10,30,15,16,20,9,9,12,11,12,10,11,11,12,10,11,13],3);
-  header(wsM,4,1,['S/N','Card No.','Name','Team','Project','Occupation','Days Worked','Duty Hours','Monthly Salary (BD)','Daily Salary (BD)','Basic Cost (BD)','OT Hrs (Normal)','OT Hrs (Fri / Holiday)','OT Rate / Hr (BD)','OT Cost (BD)','Food Allow.','Food Cost (BD)','Total Cost (BD)']);
+  const wsM = sheet('Manpower','MANPOWER & LABOUR COST',subLine+' · salaries are confidential',[7,10,30,15,16,20,9,9,12,11,12,10,11,11,12,10,11,13,12,13],3);
+  header(wsM,4,1,['S/N','Card No.','Name','Team','Project','Occupation','Days Worked','Duty Hours','Monthly Salary (BD)','Daily Salary (BD)','Basic Cost (BD)','OT Hrs (Normal)','OT Hrs (Fri / Holiday)','OT Rate / Hr (BD)','OT Cost (BD)','Food Allow.','Food Cost (BD)','Total Cost (BD)','Allowance / Month (BD)','Allowance Cost (BD)']);
   const mF=5, mL=mF+Math.max(s.labor.length,1)-1, mT=mL+1;
   s.labor.forEach((r,i)=>{ const n=mF+i, sp=otSplit[r.card_no]||{otn:0,oth:0};
     wsM.getRow(n).values=[F('ROW()-4',i+1), r.card_no, r.name, r.team, r.project||'', r.occupation||'', r.days_worked, Number(r.hours||0), r.basic,
       F(`I${n}/${DPM}`,r.daily), F(`G${n}*J${n}`,r.basic_cost), Number(sp.otn||0), Number(sp.oth||0), F(`J${n}/${HPD}*${OTM}`,r.ot_rate),
-      F(`(L${n}*${OTM}+M${n}*${OTH})*J${n}/${HPD}`,r.ot_cost), Number(r.food_n||0), F(`P${n}*${FOOD}`,r.food_cost), F(`K${n}+O${n}+Q${n}`,r.total)];
-    bodyRow(wsM,n,1,18,i); });
-  wsM.getRow(mT).values=['TOTAL','','','','','',F(`SUM(G${mF}:G${mL})`,s.labor.reduce((a,b)=>a+b.days_worked,0)),F(`SUM(H${mF}:H${mL})`,s.labor.reduce((a,b)=>a+Number(b.hours||0),0)),'','',F(`SUM(K${mF}:K${mL})`,s.laborTot.basic),F(`SUM(L${mF}:L${mL})`,s.labor.reduce((a,b)=>a+Number((otSplit[b.card_no]||{}).otn||0),0)),F(`SUM(M${mF}:M${mL})`,s.labor.reduce((a,b)=>a+Number((otSplit[b.card_no]||{}).oth||0),0)),'',F(`SUM(O${mF}:O${mL})`,s.laborTot.ot),F(`SUM(P${mF}:P${mL})`,s.labor.reduce((a,b)=>a+Number(b.food_n||0),0)),F(`SUM(Q${mF}:Q${mL})`,s.laborTot.food),F(`SUM(R${mF}:R${mL})`,s.laborTot.total)];
-  totalsRow(wsM,mT,1,18); nf(wsM,[9,10,11,14,15,17,18],RPT.money,mF,mT); nf(wsM,[8,12,13],RPT.hrs,mF,mT);
-  wsM.autoFilter={from:{row:4,column:1},to:{row:4,column:18}};
+      F(`(L${n}*${OTM}+M${n}*${OTH})*J${n}/${HPD}`,r.ot_cost), Number(r.food_n||0), F(`P${n}*${FOOD}`,r.food_cost), F(`K${n}+O${n}+Q${n}+T${n}`,r.total), Number(r.allow||0), F(`G${n}*S${n}/${DPM}`,r.allow_cost)];
+    bodyRow(wsM,n,1,20,i); });
+  wsM.getRow(mT).values=['TOTAL','','','','','',F(`SUM(G${mF}:G${mL})`,s.labor.reduce((a,b)=>a+b.days_worked,0)),F(`SUM(H${mF}:H${mL})`,s.labor.reduce((a,b)=>a+Number(b.hours||0),0)),'','',F(`SUM(K${mF}:K${mL})`,s.laborTot.basic),F(`SUM(L${mF}:L${mL})`,s.labor.reduce((a,b)=>a+Number((otSplit[b.card_no]||{}).otn||0),0)),F(`SUM(M${mF}:M${mL})`,s.labor.reduce((a,b)=>a+Number((otSplit[b.card_no]||{}).oth||0),0)),'',F(`SUM(O${mF}:O${mL})`,s.laborTot.ot),F(`SUM(P${mF}:P${mL})`,s.labor.reduce((a,b)=>a+Number(b.food_n||0),0)),F(`SUM(Q${mF}:Q${mL})`,s.laborTot.food),F(`SUM(R${mF}:R${mL})`,s.laborTot.total),'',F(`SUM(T${mF}:T${mL})`,s.laborTot.allow)];
+  totalsRow(wsM,mT,1,20); nf(wsM,[9,10,11,14,15,17,18,19,20],RPT.money,mF,mT); nf(wsM,[8,12,13],RPT.hrs,mF,mT);
+  wsM.autoFilter={from:{row:4,column:1},to:{row:4,column:20}};
   const M = c=>R('Manpower',c,mF,mL);
 
   /* ---------- Asset Hire (one line per asset per day) ---------- */

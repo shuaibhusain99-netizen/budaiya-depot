@@ -638,7 +638,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-07.2';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-07.3';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -1370,16 +1370,16 @@ async function buildDailyCostReport(date){
     const RM = matRates(date);
     const RH=['S/N','Excavation No.','Complaint No.','Type','Team','Received','Completed On','Days','Status','Area','Building','Road','Block','Length (m)','Width (m)','Thick (cm)','RB Thick (cm)','Milling','Area (m²)',
               '60mm Yellow (pcs)','60mm Other (pcs)','80mm Yellow (pcs)','80mm Other (pcs)','New Kerbs (pcs)','Old Kerbs (pcs)','Concrete (m³)','Asphalt (m³)','Road Base (m³)',
-              'Road Base (BD)','Concrete (BD)','Kerbs (BD)','Brick Supply (BD)','Brick Placing (BD)','Asphalt (BD)','Work Done (BD)','Material Cost (BD)','Net (BD)','Margin %'];
+              'Road Base (BD)','Concrete (BD)','Kerbs (BD)','Brick Supply (BD)','Brick Placing (BD)','Asphalt (BD)','Work Done (BD)','Material Cost (BD)','Net (BD)'];
     const RC = RH.length;
     const CL = n=>{ let t=''; while(n>0){ const m=(n-1)%26; t=String.fromCharCode(65+m)+t; n=Math.floor((n-1)/26); } return t; };
     const col = name=> CL(RH.indexOf(name)+1);
     const cRec=col('Received'), cDone=col('Completed On'), cDays=col('Days'), cS=col('Status'), cT=col('Team'), cA=col('Area (m²)'), cL=col('Length (m)'), cWd=col('Width (m)'),
           cY60=col('60mm Yellow (pcs)'), cO60=col('60mm Other (pcs)'), cY80=col('80mm Yellow (pcs)'), cO80=col('80mm Other (pcs)'), cKN=col('New Kerbs (pcs)'), cKO=col('Old Kerbs (pcs)'), cCo=col('Concrete (m³)'), cAs=col('Asphalt (m³)'), cRb=col('Road Base (m³)'),
-          cB1=col('Road Base (BD)'), cB6=col('Asphalt (BD)'), cW=col('Work Done (BD)'), cM=col('Material Cost (BD)'), cN=col('Net (BD)'), cP=col('Margin %');
+          cB1=col('Road Base (BD)'), cB6=col('Asphalt (BD)'), cW=col('Work Done (BD)'), cM=col('Material Cost (BD)'), cN=col('Net (BD)');
     const rateCol=RC+2, rateL=CL(rateCol+1);
     wsR.getRow(4).values=RH.concat(['','Unit cost','BD']); styleHeader(wsR.getRow(4),1,RC); wsR.getRow(4).height=32; styleHeader(wsR.getRow(4),rateCol,rateCol+1);
-    const widths=[5,14,14,10,11,11,11,6,15,20,8,7,7,8,8,7,8,7,9, 8,8,8,8,7,7,9,9,9, 10,10,10,10,10,10,13,13,13,9, 3,30,10];
+    const widths=[5,14,14,10,11,11,11,6,15,20,8,7,7,8,8,7,8,7,9, 8,8,8,8,7,7,9,9,9, 10,10,10,10,10,10,13,13,13, 3,30,10];
     widths.forEach((w,i)=>wsR.getColumn(i+1).width=w);
     const rateRows=[['60mm Yellow brick (per piece)','b60_yellow'],['60mm Other colour brick (per piece)','b60_other'],['80mm Yellow brick (per piece)','b80_yellow'],['80mm Other colour brick (per piece)','b80_other'],['Kerb stone (per piece)','kerb'],['Concrete (per m³)','concrete'],['Asphalt (per m³)','asphalt'],['Road base (per m³)','roadbase']];
     const rFirst=5, rLast=rFirst+Math.max(rj.length,1)-1, rTot=rLast+1;
@@ -1396,16 +1396,16 @@ async function buildDailyCostReport(date){
         Number(Q.L||0), Number(Q.W||0), Number(Q.T||0), Number(Q.RB||0), Q.milling||'', (Q.L&&Q.W)?F(`${cL}${rn}*${cWd}${rn}`,Number(Q.area||0)):Number(Q.area||0),
         Number(Q.y60||0), Number(Q.o60||0), Number(Q.y80||0), Number(Q.o80||0), Number(Q.kerbNew||0), Number(Q.kerbOld||0), Number(Q.conc_m3||0), Number(Q.asph_m3||0), Number(Q.rb_m3||0),
         ...bdKeys.map(k=> bd ? Number(bd[k]||0) : ''),
-        bdOk ? F(`SUM(${cB1}${rn}:${cB6}${rn})`,amt) : amt, F(matF,mat), F(`${cW}${rn}-${cM}${rn}`,amt-mat), F(`IFERROR(${cN}${rn}/${cW}${rn},"")`,amt?(amt-mat)/amt:'')];
+        bdOk ? F(`SUM(${cB1}${rn}:${cB6}${rn})`,amt) : amt, F(matF,mat), F(`${cW}${rn}-${cM}${rn}`,amt-mat)];
       [cRec,cDone].forEach(c=>r.getCell(c).numFmt=RPT.date); r.getCell(cDays).numFmt=RPT.int; [cL,cWd,cA,cCo,cAs,cRb].forEach(c=>r.getCell(c).numFmt='#,##0.00');
-      for(let c=RH.indexOf('Road Base (BD)')+1;c<=RH.indexOf('Net (BD)')+1;c++) r.getCell(c).numFmt=RPT.money; r.getCell(cP).numFmt=RPT.pct; zebra(r,1,RC,i); });
+      for(let c=RH.indexOf('Road Base (BD)')+1;c<=RH.indexOf('Net (BD)')+1;c++) r.getCell(c).numFmt=RPT.money; zebra(r,1,RC,i); });
     if(!rj.length){ const r=wsR.getRow(rFirst); r.getCell(1).value=1; r.getCell(3).value='No reinstatement work on this date'; [cW,cM,cN].forEach(c=>r.getCell(c).value=0); zebra(r,1,RC,0); }
     const rt=wsR.getRow(rTot); rt.getCell(1).value='TOTAL';
     const sumCols=[[cA,'area'],[cY60,'y60'],[cO60,'o60'],[cY80,'y80'],[cO80,'o80'],[cKN,'kerbNew'],[cKO,'kerbOld'],[cCo,'conc_m3'],[cAs,'asph_m3'],[cRb,'rb_m3']];
     sumCols.forEach(([L,k])=>{ rt.getCell(L).value=F(`SUM(${L}${rFirst}:${L}${rLast})`, rj.reduce((s,w)=>s+Number(w.qy[k]||0),0)); rt.getCell(L).numFmt='#,##0.00'; });
     bdKeys.forEach((k,ix)=>{ const L=CL(RH.indexOf('Road Base (BD)')+1+ix); rt.getCell(L).value=F(`SUM(${L}${rFirst}:${L}${rLast})`, rj.reduce((s,w)=>s+Number((w.qy.bd||{})[k]||0),0)); rt.getCell(L).numFmt=RPT.money; });
     const rAmt=rj.reduce((s,w)=>s+Number(w.amount||0),0), rMat=rj.reduce((s,w)=>s+Number(w.mat_cost||0),0);
-    rt.getCell(cW).value=F(`SUM(${cW}${rFirst}:${cW}${rLast})`,rAmt); rt.getCell(cM).value=F(`SUM(${cM}${rFirst}:${cM}${rLast})`,rMat); rt.getCell(cN).value=F(`${cW}${rTot}-${cM}${rTot}`,rAmt-rMat); rt.getCell(cP).value=F(`IFERROR(${cN}${rTot}/${cW}${rTot},"")`,rAmt?(rAmt-rMat)/rAmt:''); [cW,cM,cN].forEach(c=>rt.getCell(c).numFmt=RPT.money); rt.getCell(cP).numFmt=RPT.pct; totalRow(rt,1,RC);
+    rt.getCell(cW).value=F(`SUM(${cW}${rFirst}:${cW}${rLast})`,rAmt); rt.getCell(cM).value=F(`SUM(${cM}${rFirst}:${cM}${rLast})`,rMat); rt.getCell(cN).value=F(`${cW}${rTot}-${cM}${rTot}`,rAmt-rMat); [cW,cM,cN].forEach(c=>rt.getCell(c).numFmt=RPT.money); totalRow(rt,1,RC);
     rateRows.forEach(([l,k],i)=>{ const r=wsR.getRow(5+i); r.getCell(rateCol).value=l; r.getCell(rateCol+1).value=Number(RM[k])||0; r.getCell(rateCol+1).numFmt=RPT.money; zebra(r,rateCol,rateCol+1,i); });
     Object.assign(RS, {rFirst, rLast, rTot, cW, cM, cT, cS});
     // summaries: by team and by type
@@ -3673,7 +3673,14 @@ function renderContent(){
   else if(VIEW==='data') renderData();
   else renderTable(VIEW);
 }
-function render(){ if(!DB) return; renderSidebar(); renderTopbar(); renderContent(); }
+let RENDERED_VIEW = null; const SCROLL_MEM = {};
+function render(){ if(!DB) return;
+  const tb=document.getElementById('tbody'); if(RENDERED_VIEW){ SCROLL_MEM[RENDERED_VIEW] = { win:window.scrollY, top: tb?tb.scrollTop:0, left: tb?tb.scrollLeft:0 }; }
+  const same = RENDERED_VIEW===VIEW; renderSidebar(); renderTopbar(); renderContent(); RENDERED_VIEW=VIEW;
+  const m = same ? SCROLL_MEM[VIEW] : null;
+  if(m){ const tb2=document.getElementById('tbody'); if(tb2){ tb2.scrollTop=m.top; tb2.scrollLeft=m.left; const th=document.getElementById('thead'); if(th) th.scrollLeft=m.left; } window.scrollTo(0, m.win); }
+  else window.scrollTo(0,0);
+}
 const BRAND_HEAD = sub=>`<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">${ICONS.logo}<div><div class="brand-title">BUDAIYA DEPOT</div><div class="brand-sub">${sub}</div></div></div>`;
 const RO_BTN = `<button class="btn btn-ghost" type="button" id="st-ro">Open a backup copy (read-only)</button><input type="file" id="st-ro-file" accept=".sqlite,.db,.sqlite3" style="display:none">`;
 function wireReadOnly(){ const rof=document.getElementById('st-ro-file'); const b=document.getElementById('st-ro'); if(!b) return; b.addEventListener('click', ()=>rof.click()); rof.addEventListener('change', e=>{ if(e.target.files[0]) openReadOnlyCopy(e.target.files[0]); }); }

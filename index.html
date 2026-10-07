@@ -638,7 +638,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-07.3';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-08.1';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -797,6 +797,9 @@ function migrate(){
   [['maint_type','TEXT'],['workshop','TEXT'],['meter','REAL'],['work_done','TEXT'],['parts','TEXT'],['cost_parts','REAL DEFAULT 0'],['cost_labour','REAL DEFAULT 0'],['invoice_no','TEXT'],['next_due','TEXT'],['next_due_meter','REAL'],['note','TEXT']].forEach(([c,t])=>{ if(!hasColumn('maintenance',c)) run(`ALTER TABLE maintenance ADD COLUMN ${c} ${t}`); });
   // v10: movements carry team + project; expenses carry project; utilisation has its own switch
   [['vehicle_moves','team'],['vehicle_moves','project'],['equipment_moves','team'],['equipment_moves','project'],['expenses','project']].forEach(([t,c])=>{ if(!hasColumn(t,c)) run(`ALTER TABLE ${t} ADD COLUMN ${c} TEXT`); });
+  ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'rate_from')) run(`ALTER TABLE ${t} ADD COLUMN rate_from TEXT`); });
+  // an asset's only rate entry is its first rate ever -> it applies to all past days as well (there was no earlier rate to protect)
+  run(`UPDATE asset_rates SET effective_from='2000-01-01' WHERE id IN (SELECT MIN(id) FROM asset_rates GROUP BY asset_type, asset_ref HAVING COUNT(*)=1) AND effective_from>'2000-01-01'`);
   ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'count_util')){ run(`ALTER TABLE ${t} ADD COLUMN count_util INTEGER DEFAULT 1`); run(`UPDATE ${t} SET count_util=COALESCE(count_cost,1)`); } });
   run("UPDATE vehicle_moves SET project=purpose WHERE (project IS NULL OR project='') AND COALESCE(purpose,'')<>''");
   run("UPDATE equipment_moves SET team=issued_to WHERE (team IS NULL OR team='') AND COALESCE(issued_to,'')<>''");
@@ -975,16 +978,24 @@ async function mutate(fn){
   await saveToFile(()=>{ const r=fn(); syncRateHistory(); return r; });
   return out;
 }
-/* A hire-rate change is recorded with today's date, so every day before today keeps the rate that was in force. */
+/* A hire-rate change is recorded with today's date, so every day before today keeps the rate that was in force.
+   The first rate an asset ever gets applies to all past days; "Rate applies from" on the asset form back-dates a rate explicitly. */
 function syncRateHistory(){
   if(!DB) return;
   const today = todayStr(), who = CURRENT_USER ? CURRENT_USER.display : '', now = new Date().toISOString();
   [['Vehicle','vehicles','vno'],['Equipment','equipment','no']].forEach(([type,tbl,col])=>{
-    q(`SELECT ${col} ref, COALESCE(rental_rate,0) rate, COALESCE(NULLIF(rental_basis,''),'month') basis FROM ${tbl} WHERE COALESCE(${col},'')<>''`).forEach(a=>{
+    q(`SELECT ${col} ref, COALESCE(rental_rate,0) rate, COALESCE(NULLIF(rental_basis,''),'month') basis, COALESCE(rate_from,'') rate_from FROM ${tbl} WHERE COALESCE(${col},'')<>''`).forEach(a=>{
       const last = q1('SELECT id, rate, basis, effective_from FROM asset_rates WHERE asset_type=? AND asset_ref=? ORDER BY effective_from DESC, id DESC LIMIT 1',[type, a.ref]);
+      const explicit = /^\d{4}-\d{2}-\d{2}$/.test(a.rate_from) ? a.rate_from : '';
+      if(explicit) run(`UPDATE ${tbl} SET rate_from='' WHERE ${col}=?`,[a.ref]);          // one-shot instruction
       if(!last && !Number(a.rate)) return;
-      if(last && Math.abs(Number(last.rate)-Number(a.rate))<1e-9 && last.basis===a.basis) return;
-      if(last && last.effective_from>=today) run('UPDATE asset_rates SET rate=?, basis=?, effective_from=?, set_by=?, set_at=? WHERE id=?',[Number(a.rate), a.basis, today, who, now, last.id]);
+      if(!explicit && last && Math.abs(Number(last.rate)-Number(a.rate))<1e-9 && last.basis===a.basis) return;
+      if(explicit){   // back-dated (or forward-dated) rate: it replaces every entry from that date on
+        run('DELETE FROM asset_rates WHERE asset_type=? AND asset_ref=? AND effective_from>=?',[type, a.ref, explicit]);
+        run('INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by,set_at) VALUES(?,?,?,?,?,?,?)',[type, a.ref, Number(a.rate), a.basis, explicit, who, now]);
+      }
+      else if(!last) run('INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by,set_at) VALUES(?,?,?,?,?,?,?)',[type, a.ref, Number(a.rate), a.basis, '2000-01-01', who, now]);   // first rate ever: valid for all past days too
+      else if(last.effective_from>=today) run('UPDATE asset_rates SET rate=?, basis=?, effective_from=?, set_by=?, set_at=? WHERE id=?',[Number(a.rate), a.basis, today, who, now, last.id]);
       else run('INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by,set_at) VALUES(?,?,?,?,?,?,?)',[type, a.ref, Number(a.rate), a.basis, today, who, now]);
     });
   });
@@ -1672,6 +1683,7 @@ const ENTITIES = {
       PROJECT_COL,
       {key:'rental_rate', label:'Hire rate (BD)', type:'money', w:100, num:true, section:'Rental (cost analysis)', hint:'Changing the rate applies from today onward — earlier days keep the rate that was in force (see History → Hire rate history)'},
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, default:()=>'hour', w:90, moneyOnly:true, hint:'hour = charged for the duty hours of the driver / team that day'},
+      {key:'rate_from', label:'Rate applies from', type:'date', hideInTable:true, moneyOnly:true, hint:'Leave empty: the first rate ever applies to all past days, a changed rate applies from today. Pick a date to back-date the rate (it replaces any later rate entries).'},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this vehicle from cost analysis and utilisation'},
       {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
@@ -1706,6 +1718,7 @@ const ENTITIES = {
       PROJECT_COL,
       {key:'rental_rate', label:'Hire rate (BD)', type:'money', w:100, num:true, section:'Rental (cost analysis)', hint:'Changing the rate applies from today onward — earlier days keep the rate that was in force (see History → Hire rate history)'},
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, default:()=>'hour', w:90, moneyOnly:true, hint:'hour = charged for the duty hours of the driver / team that day'},
+      {key:'rate_from', label:'Rate applies from', type:'date', hideInTable:true, moneyOnly:true, hint:'Leave empty: the first rate ever applies to all past days, a changed rate applies from today. Pick a date to back-date the rate (it replaces any later rate entries).'},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this equipment from cost analysis and utilisation'},
       {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}

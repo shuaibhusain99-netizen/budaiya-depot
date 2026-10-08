@@ -638,7 +638,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-08.3';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-08.4';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -2301,7 +2301,12 @@ async function toggleCost(key, id, col){
     const ans = window.prompt('Count this asset in cost from which date? (dd/mm/yyyy — leave empty for all days)', curFrom ? fmtDate(curFrom) : '');
     if(ans===null) return; from = parseUserDate(ans); if(from===null){ toast('Date not understood — use dd/mm/yyyy','bad'); return; }
   }
-  await mutate(()=>{ run(`UPDATE ${cfg.table} SET ${col}=? WHERE id=?`,[cur?0:1, id]); if(from!==null) run(`UPDATE ${cfg.table} SET count_from=? WHERE id=?`,[from, id]); });
+  await mutate(()=>{ run(`UPDATE ${cfg.table} SET ${col}=? WHERE id=?`,[cur?0:1, id]); if(from!==null) run(`UPDATE ${cfg.table} SET count_from=? WHERE id=?`,[from, id]);
+    // counted from a past date: make sure its hire rate is also valid from that date (the rate history otherwise starts when the rate was typed in)
+    if(!cur && col==='count_cost'){ const a=q1(`SELECT * FROM ${cfg.table} WHERE id=?`,[id]); const type = key==='vehicles'?'Vehicle':'Equipment', ref = key==='vehicles'?a.vno:a.no; const start = from || '2000-01-01';
+      const first = q1('SELECT id, effective_from FROM asset_rates WHERE asset_type=? AND asset_ref=? ORDER BY effective_from, id LIMIT 1',[type, ref]);
+      if(first && first.effective_from>start) run('UPDATE asset_rates SET effective_from=? WHERE id=?',[start, first.id]);
+      else if(!first && Number(a.rental_rate)>0) run('INSERT INTO asset_rates(asset_type,asset_ref,rate,basis,effective_from,set_by,set_at) VALUES(?,?,?,?,?,?,?)',[type, ref, Number(a.rental_rate), a.rental_basis||'hour', start, CURRENT_USER?CURRENT_USER.display:'', new Date().toISOString()]); } });
   const what = col==='count_util' ? 'the Utilisation report' : 'cost analysis';
   toast(cur?'Excluded from '+what:'Now counted in '+what, cur?'warn':'good');
   render();

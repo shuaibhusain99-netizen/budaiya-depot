@@ -638,7 +638,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-08.2';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-08.3';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -1311,12 +1311,20 @@ async function buildDailyCostReport(date){
   const eqs = q('SELECT * FROM equipment WHERE COALESCE(count_cost,1)=1 ORDER BY no').filter(a=>!PJ || (a.project||'')===PJ).map(a=>({...a, team:canon(a.team)}));
   const assets = [];
   const hctx = hireContext(date, date);
-  const elsewhere = [];   // assets of this depot that another project is using today — listed in the note, not counted
+  /* every asset switched on for cost is listed; when it is not charged on this date the Remark column says why */
   const hireRow = (type, a, extra)=>{ const h = assetHireDay(hctx, type, a, date); const k=type+'|'+(type==='Vehicle'?a.vno:a.no);
-    if(a.count_from && date < a.count_from) return null;   // not yet counted on this date
-    const home = PJ || a.project || ''; if(home && h.project && h.project!==home){ elsewhere.push({ref:(type==='Vehicle'?a.vno:a.no), desc:extra.desc, project:h.project}); return null; }
-    return Object.assign({team: canon(h.team||a.team||''), avail: h.hours>0 && h.rate>0, hours: h.hours, src: h.src,
-      rateHr: h.hours>0 ? (h.basis==='hour' ? h.rate : h.cost/h.hours) : (h.basis==='hour' ? h.rate : 0), used: h.used, fuel: fuel[k]||0}, extra); };
+    let remark = '';
+    const home = PJ || a.project || '';
+    if(a.count_from && date < a.count_from) remark = 'Not counted before '+fmtDate(a.count_from);
+    else if(home && h.project && h.project!==home) remark = 'Used by '+h.project;
+    else if(h.src==='out of service') remark = 'Out of service';
+    else if(h.src==='maintenance') remark = 'In maintenance';
+    else if(h.src==='not on hire') remark = 'Rental not started / ended (rental dates on the asset)';
+    else if(!(h.rate>0)){ const first = (hctx.rates[k]||[])[0]; remark = first ? 'No hire rate on this date (rate history starts '+fmtDate(first.effective_from)+')' : 'No hire rate set'; }
+    else if(h.src==='team off') remark = 'Team not on duty';
+    const blocked = !!remark && /^Not counted|^Used by|^Out of|^In maint|^Rental/.test(remark);
+    return Object.assign({team: canon(h.team||a.team||''), avail: !blocked && h.hours>0 && h.rate>0, hours: blocked?0:h.hours, src: h.src, remark,
+      rateHr: blocked ? 0 : (h.hours>0 ? (h.basis==='hour' ? h.rate : h.cost/h.hours) : (h.basis==='hour' ? h.rate : 0)), used: blocked?false:h.used, fuel: blocked?0:(fuel[k]||0)}, extra); };
   eqs.forEach(a=>{ const r=hireRow('Equipment', a, {cls:assetClassOf('Equipment',a), desc:a.item, no:a.serial||a.no}); if(r) assets.push(r); });
   vehs.forEach(a=>{ const r=hireRow('Vehicle', a, {cls:'Vehicle', desc:a.model||a.type||'', no:a.vno}); if(r) assets.push(r); });
   assets.sort((x,y)=> (x.cls==='Machinery'?0:x.cls==='Vehicle'?1:2)-(y.cls==='Machinery'?0:y.cls==='Vehicle'?1:2));
@@ -1365,15 +1373,15 @@ async function buildDailyCostReport(date){
   const wsA = wb.addWorksheet('Assets', {views:[{state:'frozen', ySplit:4}]});
   wsA.getCell('B2').value='ASSET REGISTER'; wsA.getCell('B2').font={bold:true,size:14};
 
-  wsA.getRow(4).values=['S/N','Asset Class','Section ','Asset / Description','Vehicle No.','Assigned To Team','Available Today','Hire Rate (BD/Hr)','Duty Hours','Hire Charged (BD)','Used Today','Hours Used','Utilisation %','Idle Hire Cost (BD)','Fuel (BD)','Total Charge (BD)']; styleHeader(wsA.getRow(4),1,16); wsA.getRow(4).height=32;
-  [5,18,18,40.9,17.7,17,13,14,13,14,11,12,12,15,11,14].forEach((w,i)=>wsA.getColumn(i+1).width=w);
+  wsA.getRow(4).values=['S/N','Asset Class','Section ','Asset / Description','Vehicle No.','Assigned To Team','Available Today','Hire Rate (BD/Hr)','Duty Hours','Hire Charged (BD)','Used Today','Hours Used','Utilisation %','Idle Hire Cost (BD)','Fuel (BD)','Total Charge (BD)','Remark']; styleHeader(wsA.getRow(4),1,17); wsA.getRow(4).height=32;
+  [5,18,18,40.9,17.7,17,13,14,13,14,11,12,12,15,11,14,42].forEach((w,i)=>wsA.getColumn(i+1).width=w);
   const aFirst=5, aLast=aFirst+Math.max(assets.length,1)-1, aTot=aLast+1;
   let hireTot=0, idleTot=0, fuelTot=0;
   assets.forEach((a,i)=>{ const rn=aFirst+i; const charged = a.avail? a.rateHr*a.hours : 0; const hrsUsed = (a.avail && a.used)? a.hours:0; const util = charged && a.hours? hrsUsed/a.hours : 0; const idle = charged*(1-util); hireTot+=charged; idleTot+=idle; fuelTot+=a.fuel;
-    const r=wsA.getRow(rn); r.values=[F('ROW()-4',i+1), a.cls, site.replace('DEPOT - ','')+' Depot', a.desc, a.no, a.team, a.avail?'Yes':'No', a.rateHr, a.hours, F(`IF($G${rn}="Yes",$H${rn}*I${rn},0)`,charged), a.used?'Yes':'No', hrsUsed, F(`IF($J${rn}=0,0,IFERROR($L${rn}/$I${rn},0))`,util), F(`$J${rn}*(1-$M${rn})`,idle), a.fuel||0, F(`$J${rn}+$O${rn}`,charged+a.fuel)];
-    [8,10,14,15,16].forEach(c=>r.getCell(c).numFmt=RPT.money); [9,12].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(13).numFmt=RPT.pct; zebra(r,1,16,i); });
-  mkTable(wsA,'Assets',4,1,16,aLast);
-  const at=wsA.getRow(aTot); at.getCell(4).value='TOTAL'; at.getCell(10).value=F(`SUM(J${aFirst}:J${aLast})`,hireTot); at.getCell(12).value=F(`SUM(L${aFirst}:L${aLast})`,0); at.getCell(13).value=F(`IFERROR(SUMIFS(L${aFirst}:L${aLast},G${aFirst}:G${aLast},"Yes")/SUMIFS(I${aFirst}:I${aLast},G${aFirst}:G${aLast},"Yes"),0)`,0); at.getCell(14).value=F(`SUM(N${aFirst}:N${aLast})`,idleTot); at.getCell(15).value=F(`SUM(O${aFirst}:O${aLast})`,fuelTot); at.getCell(16).value=F(`SUM(P${aFirst}:P${aLast})`,hireTot+fuelTot); [10,14,15,16].forEach(c=>at.getCell(c).numFmt=RPT.money); at.getCell(13).numFmt=RPT.pct; totalRow(at,1,16);
+    const r=wsA.getRow(rn); r.values=[F('ROW()-4',i+1), a.cls, site.replace('DEPOT - ','')+' Depot', a.desc, a.no, a.team, a.avail?'Yes':'No', a.rateHr, a.hours, F(`IF($G${rn}="Yes",$H${rn}*I${rn},0)`,charged), a.used?'Yes':'No', hrsUsed, F(`IF($J${rn}=0,0,IFERROR($L${rn}/$I${rn},0))`,util), F(`$J${rn}*(1-$M${rn})`,idle), a.fuel||0, F(`$J${rn}+$O${rn}`,charged+a.fuel), a.remark||''];
+    [8,10,14,15,16].forEach(c=>r.getCell(c).numFmt=RPT.money); [9,12].forEach(c=>r.getCell(c).numFmt=RPT.hrs); r.getCell(13).numFmt=RPT.pct; zebra(r,1,17,i); });
+  mkTable(wsA,'Assets',4,1,17,aLast);
+  const at=wsA.getRow(aTot); at.getCell(4).value='TOTAL'; at.getCell(10).value=F(`SUM(J${aFirst}:J${aLast})`,hireTot); at.getCell(12).value=F(`SUM(L${aFirst}:L${aLast})`,0); at.getCell(13).value=F(`IFERROR(SUMIFS(L${aFirst}:L${aLast},G${aFirst}:G${aLast},"Yes")/SUMIFS(I${aFirst}:I${aLast},G${aFirst}:G${aLast},"Yes"),0)`,0); at.getCell(14).value=F(`SUM(N${aFirst}:N${aLast})`,idleTot); at.getCell(15).value=F(`SUM(O${aFirst}:O${aLast})`,fuelTot); at.getCell(16).value=F(`SUM(P${aFirst}:P${aLast})`,hireTot+fuelTot); [10,14,15,16].forEach(c=>at.getCell(c).numFmt=RPT.money); at.getCell(13).numFmt=RPT.pct; totalRow(at,1,17);
 
   /* ---------- Reinstatement (own sheet — these jobs are NOT repeated on Work-1) ---------- */
   { const wsR = wb.addWorksheet('Reinstatement', {views:[{state:'frozen', ySplit:4, xSplit:2}]});

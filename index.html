@@ -638,7 +638,16 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-08.4';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-08.5';
+const BLOCK_RANGES = {'Muharraq Depot':[[101,113],[115,122],[128,128],[200,200],[202,217],[221,229],[231,237],[240,248],[251,258],[262,266],[269,269]], 'Budaiya Depot':[[300,346],[351,351],[353,354],[356,369],[402,402],[404,408],[410,414],[419,419],[421,426],[428,428],[430,436],[438,439],[441,441],[444,444],[447,447],[449,450],[453,458],[460,460],[463,463],[465,465],[469,469],[471,471],[473,473],[475,475],[477,477],[479,479],[481,481],[502,502],[504,509],[513,515],[517,518],[520,531],[533,533],[536,545],[547,547],[549,553],[555,555],[557,557],[559,559],[561,561],[565,565],[569,569],[571,571],[575,575],[577,577],[580,590],[592,592]], 'Isa Town Depot':[[373,373],[380,382],[579,579],[591,591],[601,609],[611,611],[613,616],[623,626],[633,636],[643,646],[701,702],[704,709],[711,716],[718,718],[720,721],[729,730],[732,734],[736,736],[738,738],[740,740],[742,746],[748,748],[752,752],[754,754],[756,756],[758,758],[760,760],[762,762],[801,810],[812,816],[840,841],[920,920],[922,922],[924,924],[926,926],[933,934],[937,937],[941,941],[1001,1004],[1006,1006],[1009,1010],[1012,1012],[1014,1014],[1016,1017],[1019,1019],[1022,1022],[1089,1089],[1095,1095]], 'Riffa Depot':[[901,919],[921,921],[923,923],[925,925],[927,932],[935,935],[939,939],[942,955],[957,967],[971,971],[973,974],[976,976],[981,983],[985,989],[995,995],[997,999],[1018,1018],[1020,1020],[1025,1028],[1032,1034],[1037,1038],[1041,1042],[1044,1044],[1046,1046],[1048,1048],[1051,1052],[1054,1058],[1061,1064],[1067,1070],[1099,1099],[1101,1104],[1106,1108],[1110,1113],[1203,1216],[1218,1218]]};
+/* which depot / project a job belongs to: the export's Depot column first, then the WDD block ranges (Annexures I–IV), then the default project */
+function projectOfJob(depot, block){
+  const d=String(depot||'').trim().toUpperCase();
+  if(d){ if(/BUDAIYA/.test(d)) return 'Budaiya Depot'; if(/ISA/.test(d)) return 'Isa Town Depot'; if(/MUHARRAQ/.test(d)) return 'Muharraq Depot'; if(/RIFFA/.test(d)) return 'Riffa Depot'; }
+  const b=parseInt(String(block||'').replace(/[^0-9]/g,''),10);
+  if(b){ for(const [pj,rs] of Object.entries(BLOCK_RANGES)){ if(rs.some(([a,z])=>b>=a&&b<=z)) return pj; } }
+  return d ? d.charAt(0)+d.slice(1).toLowerCase()+' Depot' : '';
+}   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -797,6 +806,8 @@ function migrate(){
   [['maint_type','TEXT'],['workshop','TEXT'],['meter','REAL'],['work_done','TEXT'],['parts','TEXT'],['cost_parts','REAL DEFAULT 0'],['cost_labour','REAL DEFAULT 0'],['invoice_no','TEXT'],['next_due','TEXT'],['next_due_meter','REAL'],['note','TEXT']].forEach(([c,t])=>{ if(!hasColumn('maintenance',c)) run(`ALTER TABLE maintenance ADD COLUMN ${c} ${t}`); });
   // v10: movements carry team + project; expenses carry project; utilisation has its own switch
   [['vehicle_moves','team'],['vehicle_moves','project'],['equipment_moves','team'],['equipment_moves','project'],['expenses','project']].forEach(([t,c])=>{ if(!hasColumn(t,c)) run(`ALTER TABLE ${t} ADD COLUMN ${c} TEXT`); });
+  if(!hasColumn('work_log','project')){ run('ALTER TABLE work_log ADD COLUMN project TEXT'); }
+  q("SELECT id, depot, requested_by, block FROM work_log WHERE COALESCE(project,'')=''").forEach(r=>{ const pj=projectOfJob(r.depot||r.requested_by, r.block); if(pj) run('UPDATE work_log SET project=? WHERE id=?',[pj, r.id]); });
   ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'rate_from')) run(`ALTER TABLE ${t} ADD COLUMN rate_from TEXT`); if(!hasColumn(t,'count_from')) run(`ALTER TABLE ${t} ADD COLUMN count_from TEXT`); });
   // an asset's only rate entry is its first rate ever -> it applies to all past days as well (there was no earlier rate to protect)
   run(`UPDATE asset_rates SET effective_from='2000-01-01' WHERE id IN (SELECT MIN(id) FROM asset_rates GROUP BY asset_type, asset_ref HAVING COUNT(*)=1) AND effective_from>'2000-01-01'`);
@@ -1298,7 +1309,8 @@ async function buildDailyCostReport(date){
 
   /* ---------- data ---------- */
   const canon = makeCanon();
-  const work = q('SELECT * FROM work_log WHERE date=? ORDER BY id',[date]).map(w=>({...w, team:canon(w.team)}));
+  const PJ0 = COST_PROJECT||'';
+  const work = q('SELECT * FROM work_log WHERE date=? ORDER BY id',[date]).filter(w=>!PJ0 || !w.project || w.project===PJ0).map(w=>({...w, team:canon(w.team)}));
   const wk = work.filter(w=>w.category!=='Reinstatement');          // Work-1 (BOQ jobs); reinstatement has its own sheet
   const rj = work.filter(w=>w.category==='Reinstatement').map(w=>{ let qy={}; try{ qy=JSON.parse(w.reinst_q||'{}')||{}; }catch(e){} return {...w, qy}; });
   const RS = {tables:[]};                                            // Reinstatement sheet cell map, filled when that sheet is built
@@ -1676,7 +1688,7 @@ const JOB_STATUS = ['Completed','Partially Completed','Postponed','Not Completed
 const ATT_STATUS = ['Working','Absent','Vacation','Sick Leave','Other Section','Off day'];
 const MAINT_TYPES = ['Breakdown repair','Preventive service','Accident repair','Inspection / test','Tyres','Electrical','Body / paint','Other'];
 const EXPENSE_CATS = ['Fuel','Materials','Repair (external)','Transport','Permit / fees','Other'];
-function projectNames(){ const set=new Set(String(getSetting('projects','')).split('\n').map(x=>x.trim()).filter(Boolean)); q('SELECT project p FROM vehicles UNION SELECT project FROM equipment UNION SELECT project FROM employees UNION SELECT project FROM teams').forEach(r=>{ if(r.p) set.add(r.p); }); return [...set].sort(); }
+function projectNames(){ const set=new Set(String(getSetting('projects','')).split('\n').map(x=>x.trim()).filter(Boolean)); q('SELECT project p FROM vehicles UNION SELECT project FROM equipment UNION SELECT project FROM employees UNION SELECT project FROM teams UNION SELECT DISTINCT project FROM work_log').forEach(r=>{ if(r.p) set.add(r.p); }); return [...set].sort(); }
 const PROJECT_COL = {key:'project', label:'Project', type:'combo', required:true, optionsFn:()=>projectNames(), default:()=>getSetting('default_project','Budaiya Depot'), w:130, hint:'Which depot / project this belongs to — cost analysis can be filtered per project. Type a new name to create a project.'};
 function teamNames(){ return q('SELECT DISTINCT team FROM teams WHERE team<>"" UNION SELECT DISTINCT team FROM employees WHERE team<>"" UNION SELECT DISTINCT team FROM vehicles WHERE team<>"" UNION SELECT DISTINCT team FROM equipment WHERE team<>"" ORDER BY 1').map(r=>r.team); }
 const ENTITIES = {
@@ -1824,6 +1836,7 @@ const ENTITIES = {
       {key:'date', label:'Date', type:'date', required:true, w:115, default:()=>todayStr()},
       {key:'work_order', label:'Work order', type:'text', mono:true, w:120},
       {key:'requested_by', label:'Requested by', type:'combo', optionsFn:()=>q('SELECT DISTINCT requested_by v FROM work_log WHERE requested_by<>"" ORDER BY 1').map(r=>r.v), w:130},
+      {key:'project', label:'Project', type:'combo', optionsFn:()=>projectNames(), w:120, default:()=>getSetting('default_project','Budaiya Depot'), hint:'Depot / project the job belongs to'},
       {key:'location', label:'Location', type:'text', w:150, hint:'e.g. Bldg 4394, Rd 5783, Blk 457'},
       {key:'category', label:'Complaint nature / category', type:'combo', options:['Leakage (Main & service line)','Short Water / No Water','Meter Defect','Other'].concat(WORK_CATEGORIES.filter(c=>c!=='Reinstatement')), required:true, w:180, hint:'Reinstatement work has its own page'},
       {key:'description', label:'Description', type:'combo', optionsFn:()=>q('SELECT DISTINCT description v FROM work_log WHERE description<>"" ORDER BY 1').map(r=>r.v), w:220, span2:true},
@@ -1850,13 +1863,14 @@ const ENTITIES = {
       {key:'unit', label:'Unit', type:'text', hideInTable:true}
     ],
     search:['work_order','requested_by','location','category','description','team','fault','area'], dateField:'date', defaultSort:{field:'date', dir:'desc'},
-    chips:[{id:'', label:'All'},{id:'done', label:'Completed', where:'status="Completed"'},{id:'open', label:'Not completed', where:'status<>"Completed"'},{id:'fu', label:'Follow-up', where:'follow_up="YES"'}]
+    chips:[{id:'', label:'All'},{id:'pb', label:'Budaiya', where:'project="Budaiya Depot"'},{id:'pi', label:'Isa Town', where:'project="Isa Town Depot"'},{id:'done', label:'Completed', where:'status="Completed"'},{id:'open', label:'Not completed', where:'status<>"Completed"'},{id:'fu', label:'Follow-up', where:'follow_up="YES"'}]
   },
   reinst: { table:'work_log', label:'Reinstatement', singular:'Reinstatement job', icon:ICONS.report, group:'Cost', log:true, fixedWhere:'category="Reinstatement"', presets:{category:'Reinstatement', status:'Completed', qty:1},
     select:'SELECT work_log.*, COALESCE(amount,0)-COALESCE(mat_cost,0) net_bd FROM work_log',
     columns:[
       {key:'date', label:'Date', type:'date', required:true, w:110, default:()=>todayStr(), hint:'Completion date (from the KPI export) or the date received'},
       {key:'work_order', label:'Excavation No.', type:'text', mono:true, required:true, w:140},
+      {key:'project', label:'Project', type:'combo', optionsFn:()=>projectNames(), w:120, default:()=>getSetting('default_project','Budaiya Depot'), hint:'Depot / project the job belongs to (from the export\'s Depot column or the block number)'},
       {key:'materials', label:'Complaint', type:'text', w:150},
       {key:'fault', label:'Type', type:'combo', options:['Bricks reinstatement','Concrete reinstatement','Asphalt reinstatement','Kerb Stone reinstatement'], w:160, badge:true},
       {key:'team', label:'Team', type:'combo', required:true, optionsFn:()=>teamNames(), w:110, hint:'Interlock & concrete → Interlock team · Asphalt → Asphalt team'},
@@ -1876,7 +1890,7 @@ const ENTITIES = {
       {key:'location', label:'Location', type:'text', hideInTable:true, hideInForm:true}
     ],
     search:['work_order','materials','fault','team','area','road','block','stage'], dateField:'date', defaultSort:{field:'date', dir:'desc'},
-    chips:[{id:'', label:'All'},{id:'ri', label:'Interlock', where:'fault LIKE "Bricks%" OR fault LIKE "Kerb%"'},{id:'rc', label:'Concrete', where:'fault LIKE "Concrete%"'},{id:'ra', label:'Asphalt', where:'fault LIKE "Asphalt%"'},{id:'rchk', label:'Stage: Check', where:'stage="Check"'},{id:'rrev', label:'Stage: Review', where:'stage="Review"'},{id:'rwp', label:'Stage: Waiting Payment', where:'stage="Waiting Payment"'},{id:'rcomp', label:'Stage: Completed / Paid', where:'stage IN ("Completed","Paid")'},{id:'nodone', label:'No completion date', where:'COALESCE(done_date,"")=""'}]
+    chips:[{id:'', label:'All'},{id:'pb', label:'Budaiya', where:'project="Budaiya Depot"'},{id:'pi', label:'Isa Town', where:'project="Isa Town Depot"'},{id:'po', label:'Other depots', where:'COALESCE(project,"") NOT IN ("","Budaiya Depot","Isa Town Depot")'},{id:'ri', label:'Interlock', where:'fault LIKE "Bricks%" OR fault LIKE "Kerb%"'},{id:'rc', label:'Concrete', where:'fault LIKE "Concrete%"'},{id:'ra', label:'Asphalt', where:'fault LIKE "Asphalt%"'},{id:'rchk', label:'Stage: Check', where:'stage="Check"'},{id:'rrev', label:'Stage: Review', where:'stage="Review"'},{id:'rwp', label:'Stage: Waiting Payment', where:'stage="Waiting Payment"'},{id:'rcomp', label:'Stage: Completed / Paid', where:'stage IN ("Completed","Paid")'},{id:'nodone', label:'No completion date', where:'COALESCE(done_date,"")=""'}]
   },
   employees: { table:'employees', label:'Employees', singular:'Employee', icon:ICONS.users, group:'Cost',
     columns:[
@@ -2744,13 +2758,14 @@ function costSummary(from, to, opts){
   const purchases = q(`SELECT m.item_name name, SUM(m.qty) qty, SUM(m.qty * COALESCE(NULLIF(m.unit_cost,0), i.unit_cost, 0)) cost FROM stock_moves m LEFT JOIN items i ON i.name=m.item_name WHERE lower(m.type)='in' AND m.date>=? AND m.date<=? GROUP BY m.item_name ORDER BY cost DESC`,[from,to]);
   const purchTot = purchases.reduce((s,r)=>s+Number(r.cost||0),0);
   // work done
-  const workByCat = q('SELECT category, COUNT(*) jobs, SUM(qty) qty, SUM(amount) amount, SUM(CASE WHEN status="Completed" THEN 1 ELSE 0 END) done FROM work_log WHERE date>=? AND date<=? GROUP BY category ORDER BY amount DESC',[from,to]);
+  const PJW = PJ ? ` AND (COALESCE(project,'')='' OR project=?)` : '', pjArgs = PJ ? [PJ] : [];
+  const workByCat = q('SELECT category, COUNT(*) jobs, SUM(qty) qty, SUM(amount) amount, SUM(CASE WHEN status="Completed" THEN 1 ELSE 0 END) done FROM work_log WHERE date>=? AND date<=?'+PJW+' GROUP BY category ORDER BY amount DESC',[from,to,...pjArgs]);
   const tankerTeam = getSetting('tanker_team','Tanker');
-  const workByTeam = q('SELECT team, COUNT(*) jobs, SUM(amount) amount, SUM(hours) hours, SUM(COALESCE(tanker,0)+COALESCE(dewatering,0)) tk FROM work_log WHERE date>=? AND date<=? GROUP BY team',[from,to]);
+  const workByTeam = q('SELECT team, COUNT(*) jobs, SUM(amount) amount, SUM(hours) hours, SUM(COALESCE(tanker,0)+COALESCE(dewatering,0)) tk FROM work_log WHERE date>=? AND date<=?'+PJW+' GROUP BY team',[from,to,...pjArgs]);
   { let moved=0; workByTeam.forEach(r=>{ if((canon(r.team)||'').toLowerCase()!==tankerTeam.toLowerCase() && r.tk>0){ r.amount=Number(r.amount||0)-Number(r.tk||0); moved+=Number(r.tk||0); } });
     if(moved>0){ const t=workByTeam.find(r=>(canon(r.team)||'').toLowerCase()===tankerTeam.toLowerCase()); if(t) t.amount=Number(t.amount||0)+moved; else workByTeam.push({team:tankerTeam, jobs:0, amount:moved, hours:0, tk:0}); } }
   const work = { total: workByCat.reduce((s,r)=>s+Number(r.amount||0),0), jobs: workByCat.reduce((s,r)=>s+r.jobs,0), done: workByCat.reduce((s,r)=>s+r.done,0) };
-  const matByTeam = q('SELECT team, SUM(COALESCE(mat_cost,0)) m FROM work_log WHERE date>=? AND date<=? AND COALESCE(mat_cost,0)<>0 GROUP BY team',[from,to]);
+  const matByTeam = q('SELECT team, SUM(COALESCE(mat_cost,0)) m FROM work_log WHERE date>=? AND date<=? AND COALESCE(mat_cost,0)<>0'+PJW+' GROUP BY team',[from,to,...pjArgs]);
   const matTot = matByTeam.reduce((s,r)=>s+Number(r.m||0),0);
   // by team
   const teams = {};
@@ -3018,7 +3033,7 @@ async function exportCostReport(s, label){
   const DPM='Assumptions!$C$5', HPD='Assumptions!$C$6', OTM='Assumptions!$C$7', OTH='Assumptions!$C$8', FOOD='Assumptions!$C$9';
 
   /* ---------- Work ---------- */
-  const work = q('SELECT date, work_order, requested_by, location, category, description, team, status, qty, hours, amount, materials, follow_up, COALESCE(mat_cost,0) mat_cost, COALESCE(stage,"") stage, COALESCE(dewatering,0) dewatering, COALESCE(tanker,0) tanker FROM work_log WHERE date>=? AND date<=? ORDER BY date, id',[s.from,s.to]).map(w=>({...w, team:canon(w.team)||'Unassigned'}));
+  const work = q('SELECT date, work_order, requested_by, location, category, description, team, status, qty, hours, amount, materials, follow_up, COALESCE(mat_cost,0) mat_cost, COALESCE(stage,"") stage, COALESCE(dewatering,0) dewatering, COALESCE(tanker,0) tanker FROM work_log WHERE date>=? AND date<=? ORDER BY date, id',[s.from,s.to]).filter(w=>!COST_PROJECT || !w.project || w.project===COST_PROJECT).map(w=>({...w, team:canon(w.team)||'Unassigned'}));
   const wsW = sheet('Work','WORK LOG',subLine,[7,12,16,16,24,26,40,14,14,7,9,14,34,11,13,15,12,12],3);
   header(wsW,4,1,['S/N','Date','Work Order No.','Requested By','Location','Work Category','Work Description','Team','Job Status','Qty','Duration (Hrs)','Work Done (BD)','Site Details / Materials Used','Follow-up','Material Cost (BD)','Reinstatement Stage','Dewatering (BD)','Supply Tanker (BD)']);
   const wF=5, wL=wF+Math.max(work.length,1)-1, wT=wL+1;
@@ -3218,7 +3233,7 @@ const XMAP = {
   employees:{card_no:'Card No', name:'Name', cpr:'CPR', occupation:'Occupation', team:'Team', project:'Project', timing:'Timing', status:'Status', notes:'Notes'},
   attendance:{date:'Date', card_no:'Card No', name:'Name', occupation:'Occupation', type_day:'Type Day', start_time:'Start Time', normal_hours:'Normal', ot_hours:'Final', extra:'Extra', food:'Food', hours:'Hours', time_in:'In', time_out:'Out', status:'Attendance', remarks:'Remarks'},
   work_log:{date:'Date', work_order:'Work Order No.', requested_by:'Requested By', location:'Location', category:'Work Category', description:'Work Description', team:'Team', status:'Job Status', qty:'Qty', hours:'Duration (Hrs)', amount:'Work Done Amount (BD)', materials:'Site Details / Materials Used', follow_up:'Follow-up Required'},
-  reinst:{date:'Date', work_order:'Excavation No.', materials:'Complaint', fault:'Type', team:'Team', area:'Area', unit:'Building', road:'Road', block:'Block', stage:'Stage', done_date:'Completed On', amount:'Work Done (BD)', mat_cost:'Material Cost (BD)', description:'Description'},
+  reinst:{date:'Date', work_order:'Excavation No.', project:'Project', materials:'Complaint', fault:'Type', team:'Team', area:'Area', unit:'Building', road:'Road', block:'Block', stage:'Stage', done_date:'Completed On', amount:'Work Done (BD)', mat_cost:'Material Cost (BD)', description:'Description'},
   expenses:{date:'Date', category:'Category', asset_type:'Asset Type', asset_ref:'Asset Ref', team:'Team', project:'Project', amount:'Amount', note:'Note'},
   teams:{team:'Team', project:'Project', note:'Note'},
   departments:{department:'Department', inside:'INSIDE'}
@@ -3418,7 +3433,7 @@ function importReinstatement(wb){
     const loc = [areaName, r['House']!==''?'Bldg '+S(r['House']):'', r['Road']!==''?'Rd '+S(r['Road']):'', r['Block']!==''?'Blk '+S(r['Block']):''].filter(Boolean).join(', ');
     const parts = [`${type} reinstatement`, area?`${L}×${W} m`:'' , T?`${T} cm`:'', milling?'milling':'', newK?`${newK} new kerb`:'', oldK?`${oldK} old kerb`:'', (y60+o60)?`${y60+o60}× 60mm bricks`:'', (y80+o80)?`${y80+o80}× 80mm bricks`:''].filter(Boolean);
     run('DELETE FROM work_log WHERE work_order=?',[exc]);
-    insertRow('work_log',{date, work_order:exc, requested_by:depot, depot, location:loc, category:'Reinstatement', description:parts.join(' · '), team, status, qty:1, hours:0, amount:cost, materials:S(r['Complaint No']), follow_up:'NO',
+    insertRow('work_log',{date, work_order:exc, requested_by:depot, depot, project:projectOfJob(depot, r['Block']), location:loc, category:'Reinstatement', description:parts.join(' · '), team, status, qty:1, hours:0, amount:cost, materials:S(r['Complaint No']), follow_up:'NO',
       unit:S(r['House']), building:'', road:S(r['Road']), block:S(r['Block']), area:areaName, fault:type+' reinstatement', pack:'', price:cost, add_pack:'', add_price:0, dewatering:0, tanker:0, others:0,
       stage: stage||'', done_date: doneDate, mat_cost: matCost, reinst_q: JSON.stringify(qty)});
     n++;
@@ -3465,7 +3480,7 @@ function importFiles(files, kind){
               const dew = N(r['Dewatering Amount']), tank = N(r['Supply Tanker Amount']), price = N(r['Price']), addPrice = N(g(r,'Multiple Amount','Multible Amount')), total = N(r['Total Amount']);
               let others = N(r['Deep Amount']); const rest = Math.round((total-(price+addPrice+dew+tank+others))*1000)/1000; if(Math.abs(rest)>0.0005) others = Math.round((others+rest)*1000)/1000;   // anything else in the total (lean mix etc.) is shown under Others so the Work sheet always adds up to the BOQ total
               run('DELETE FROM work_log WHERE work_order=?',[no]);
-              insertRow('work_log',{date, work_order:no, requested_by:S(r['Depot']), depot:S(r['Depot']), location:loc, category:natureOf(fault), description:fault||'Leak repair', team, status:'Completed', qty:1, hours:0, amount:total, materials:S(r['Remarks']), follow_up:'NO',
+              insertRow('work_log',{date, work_order:no, requested_by:S(r['Depot']), depot:S(r['Depot']), project:projectOfJob(S(r['Depot']), g(r,'Block ','Block')), location:loc, category:natureOf(fault), description:fault||'Leak repair', team, status:'Completed', qty:1, hours:0, amount:total, materials:S(r['Remarks']), follow_up:'NO',
                 unit:S(r['Unit']), building:S(r['Building']), road:S(r['Road']), block:S(g(r,'Block ','Block')), area:S(r['Area']), fault, pack:S(r['Pack']), price, add_pack:S(g(r,'Multiple','Multible'))||S(r['Multiple Pack']), add_price:addPrice, dewatering:dew, tanker:tank, others}); rows++; });
           }
           else if(kind==='reinst'){ rows += importReinstatement(wb); }

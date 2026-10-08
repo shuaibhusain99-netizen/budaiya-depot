@@ -638,7 +638,7 @@ const SEED_DATA = {"drivers": [], "vehicles": [], "vehicleMoves": [], "equipment
    - The server keeps one automatic backup per day for 30 days.
    ===================================================================== */
 const SCHEMA_VERSION = 13;
-const APP_BUILD = '2026-10-08.1';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
+const APP_BUILD = '2026-10-08.2';   // shown in the sidebar; the app checks GitHub for a newer build and offers to reload
 const HANDLE_DB = 'budaiya-depot-file-handle';   // stores the file pointer only, never data
 let SQL = null, DB = null, FILE_HANDLE = null;
 let FILE_INFO = { name:'', lastModified:0, size:0, readOnly:false, online:false };
@@ -797,7 +797,7 @@ function migrate(){
   [['maint_type','TEXT'],['workshop','TEXT'],['meter','REAL'],['work_done','TEXT'],['parts','TEXT'],['cost_parts','REAL DEFAULT 0'],['cost_labour','REAL DEFAULT 0'],['invoice_no','TEXT'],['next_due','TEXT'],['next_due_meter','REAL'],['note','TEXT']].forEach(([c,t])=>{ if(!hasColumn('maintenance',c)) run(`ALTER TABLE maintenance ADD COLUMN ${c} ${t}`); });
   // v10: movements carry team + project; expenses carry project; utilisation has its own switch
   [['vehicle_moves','team'],['vehicle_moves','project'],['equipment_moves','team'],['equipment_moves','project'],['expenses','project']].forEach(([t,c])=>{ if(!hasColumn(t,c)) run(`ALTER TABLE ${t} ADD COLUMN ${c} TEXT`); });
-  ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'rate_from')) run(`ALTER TABLE ${t} ADD COLUMN rate_from TEXT`); });
+  ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'rate_from')) run(`ALTER TABLE ${t} ADD COLUMN rate_from TEXT`); if(!hasColumn(t,'count_from')) run(`ALTER TABLE ${t} ADD COLUMN count_from TEXT`); });
   // an asset's only rate entry is its first rate ever -> it applies to all past days as well (there was no earlier rate to protect)
   run(`UPDATE asset_rates SET effective_from='2000-01-01' WHERE id IN (SELECT MIN(id) FROM asset_rates GROUP BY asset_type, asset_ref HAVING COUNT(*)=1) AND effective_from>'2000-01-01'`);
   ['vehicles','equipment'].forEach(t=>{ if(!hasColumn(t,'count_util')){ run(`ALTER TABLE ${t} ADD COLUMN count_util INTEGER DEFAULT 1`); run(`UPDATE ${t} SET count_util=COALESCE(count_cost,1)`); } });
@@ -1313,6 +1313,7 @@ async function buildDailyCostReport(date){
   const hctx = hireContext(date, date);
   const elsewhere = [];   // assets of this depot that another project is using today — listed in the note, not counted
   const hireRow = (type, a, extra)=>{ const h = assetHireDay(hctx, type, a, date); const k=type+'|'+(type==='Vehicle'?a.vno:a.no);
+    if(a.count_from && date < a.count_from) return null;   // not yet counted on this date
     const home = PJ || a.project || ''; if(home && h.project && h.project!==home){ elsewhere.push({ref:(type==='Vehicle'?a.vno:a.no), desc:extra.desc, project:h.project}); return null; }
     return Object.assign({team: canon(h.team||a.team||''), avail: h.hours>0 && h.rate>0, hours: h.hours, src: h.src,
       rateHr: h.hours>0 ? (h.basis==='hour' ? h.rate : h.cost/h.hours) : (h.basis==='hour' ? h.rate : 0), used: h.used, fuel: fuel[k]||0}, extra); };
@@ -1685,6 +1686,7 @@ const ENTITIES = {
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, default:()=>'hour', w:90, moneyOnly:true, hint:'hour = charged for the duty hours of the driver / team that day'},
       {key:'rate_from', label:'Rate applies from', type:'date', hideInTable:true, moneyOnly:true, hint:'Leave empty: the first rate ever applies to all past days, a changed rate applies from today. Pick a date to back-date the rate (it replaces any later rate entries).'},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this vehicle from cost analysis and utilisation'},
+      {key:'count_from', label:'Counted from (date)', type:'date', hideInTable:true, moneyOnly:true, section:'Cost analysis', hint:'The asset is counted in cost, utilisation and the daily report only from this date on. Empty = from the beginning.'},
       {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
     ],
@@ -1720,6 +1722,7 @@ const ENTITIES = {
       {key:'rental_basis', label:'Rate is per', type:'select', options:RATE_BASIS, default:()=>'hour', w:90, moneyOnly:true, hint:'hour = charged for the duty hours of the driver / team that day'},
       {key:'rate_from', label:'Rate applies from', type:'date', hideInTable:true, moneyOnly:true, hint:'Leave empty: the first rate ever applies to all past days, a changed rate applies from today. Pick a date to back-date the rate (it replaces any later rate entries).'},
       {key:'count_cost', label:'Count in cost', type:'toggle', w:110, section:'Cost analysis', default:()=>1, moneyOnly:true, hint:'Turn off to exclude this equipment from cost analysis and utilisation'},
+      {key:'count_from', label:'Counted from (date)', type:'date', hideInTable:true, moneyOnly:true, section:'Cost analysis', hint:'The asset is counted in cost, utilisation and the daily report only from this date on. Empty = from the beginning.'},
       {key:'count_util', label:'Count in utilisation', type:'toggle', w:130, section:'Cost analysis', default:()=>1, hint:'Off = this asset is left out of the Utilisation report only (cost analysis is unaffected)'},
       {key:'notes', label:'Notes', type:'textarea', hideInTable:true}
     ],
@@ -2280,10 +2283,17 @@ function openMovementFor(type, ref){
     openForm('equipment_moves', null, {item:e.item, serial:e.serial||''});
   }
 }
+function parseUserDate(t){ t=String(t||'').trim(); if(!t) return ''; let m=t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/); if(m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`; m=t.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/); if(m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`; return null; }
 async function toggleCost(key, id, col){
   col = col==='count_util' ? 'count_util' : 'count_cost';
   const cfg = ENTITIES[key]; const cur = qv(`SELECT ${col} FROM ${cfg.table} WHERE id=?`,[id]);
-  await mutate(()=> run(`UPDATE ${cfg.table} SET ${col}=? WHERE id=?`,[cur?0:1, id]));
+  let from = null;
+  if(!cur && col==='count_cost'){   // switching ON: from which date?
+    const curFrom = qv(`SELECT COALESCE(count_from,'') FROM ${cfg.table} WHERE id=?`,[id]);
+    const ans = window.prompt('Count this asset in cost from which date? (dd/mm/yyyy — leave empty for all days)', curFrom ? fmtDate(curFrom) : '');
+    if(ans===null) return; from = parseUserDate(ans); if(from===null){ toast('Date not understood — use dd/mm/yyyy','bad'); return; }
+  }
+  await mutate(()=>{ run(`UPDATE ${cfg.table} SET ${col}=? WHERE id=?`,[cur?0:1, id]); if(from!==null) run(`UPDATE ${cfg.table} SET count_from=? WHERE id=?`,[from, id]); });
   const what = col==='count_util' ? 'the Utilisation report' : 'cost analysis';
   toast(cur?'Excluded from '+what:'Now counted in '+what, cur?'warn':'good');
   render();
@@ -2438,6 +2448,14 @@ function confirmDelete(key, id){
 
 /* ===================================================================== asset drawer (vehicle / equipment history) */
 let DRAWER_TAB = 'moves';
+/* mark an asset Used / Not used on one day (an explicit log wins over movements / duty-based inference) */
+async function setDailyUsage(type, ref, date, status){
+  const a = type==='Vehicle' ? q1('SELECT * FROM vehicles WHERE vno=?',[ref]) : q1('SELECT * FROM equipment WHERE no=?',[ref]);
+  const name = a ? (type==='Vehicle' ? (a.model||a.type||'') : a.item) : '';
+  await mutate(()=>{ run('DELETE FROM daily_usage WHERE asset_type=? AND asset_ref=? AND date=?',[type, ref, date]);
+    if(status) run('INSERT INTO daily_usage(date,asset_type,asset_ref,asset_name,status,team) VALUES(?,?,?,?,?,?)',[date, type, ref, name, status, a?(a.team||''):'']); });
+}
+function usageOn(type, ref, date){ const r=q1('SELECT status FROM daily_usage WHERE asset_type=? AND asset_ref=? AND date=?',[type, ref, date]); return r ? r.status : null; }
 function openAssetDrawer(type, ref, tab){
   DRAWER_TAB = tab || DRAWER_TAB;
   const isV = type==='Vehicle';
@@ -2454,13 +2472,18 @@ function openAssetDrawer(type, ref, tab){
   const usedYear = assetUsedDays(type, a, `${y}-01-01`, todayStr());
   const title = isV ? `${a.vno} · ${a.model||a.type||''}` : `${a.item}`;
   const sub = isV ? `${a.type||''} · ${a.team||'no team'} · ${a.driver||'no driver'} · ${a.site||''}` : `${a.no} · ${a.serial||'no serial'} · ${a.fuel||''}${a.team?' · '+a.team:''}`;
-  const tabs = [['moves',`Movements (${moves.length})`],['maint',`Maintenance (${mt.length})`]].concat(can('cost')?[['cost','Cost & utilisation']]:[]);
+  const tabs = [['moves',`Movements (${moves.length})`],['maint',`Maintenance (${mt.length})`],['usage','Daily usage']].concat(can('cost')?[['cost','Cost & utilisation']]:[]);
   if(!can('cost') && DRAWER_TAB==='cost') DRAWER_TAB='moves';
   let body = '';
   if(DRAWER_TAB==='moves'){
     body = moves.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>Out</th><th>${isV?'Driver':'Department'}</th><th>${isV?'Purpose':'Assigned / issued to'}</th><th>Returned</th><th>Days</th></tr></thead><tbody>${moves.map(m=>{
       const d = m.return_date ? Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)) : daysSince(m.date_out);
       return `<tr><td class="mono">${esc(m.date_out)} ${esc(m.time_out||'')}</td><td>${esc(isV?m.driver:m.department)}</td><td>${esc(isV?(m.purpose||''):[m.assigned,m.issued_to].filter(Boolean).join(' · '))}</td><td>${m.return_date?`<span class="mono">${esc(m.return_date)} ${esc(m.return_time||'')}</span>`:'<span class="badge bad"><span class="dot"></span>Out</span>'}</td><td class="num mono">${d??''}</td></tr>`;}).join('')}</tbody></table></div>` : `<div class="empty-row">No movements recorded.</div>`;
+  } else if(DRAWER_TAB==='usage'){
+    const ctx = hireContext(addDays(todayStr(),-29), todayStr()); const days=[]; for(let i=0;i<30;i++){ const d=addDays(todayStr(),-i); const h=assetHireDay(ctx,type,a,d); days.push({d, h, logged:usageOn(type,ref,d)}); }
+    body = `<div class="field-note" style="margin-bottom:10px">Mark whether the ${isV?'vehicle':'equipment'} was actually used on a day. A mark here overrides what the system infers from movements and the team's duty. Idle hire = hire charged on days marked / inferred as not used.</div>
+      <div class="btn-row" style="margin-bottom:12px"><input type="date" class="inp" id="du-date" value="${todayStr()}"><button class="btn btn-sm btn-good" data-du="Used">Used</button><button class="btn btn-sm" data-du="Idle">Not used</button><button class="btn btn-sm btn-ghost" data-du="">Clear mark</button></div>
+      <div class="scroll-x"><table class="plain"><thead><tr><th>Date</th><th>Status</th><th>Source</th><th>Team</th><th class="num">Duty hrs</th><th class="num">Hire (BD)</th><th></th></tr></thead><tbody>${days.map(x=>`<tr><td class="mono">${esc(x.d)}</td><td>${x.logged ? (x.logged==='Used'?'<span class="badge good"><span class="dot"></span>Used (marked)</span>':'<span class="badge bad"><span class="dot"></span>Not used (marked)</span>') : (x.h.src==='not counted yet'||x.h.src==='not on hire'||x.h.src==='maintenance'||x.h.src==='out of service' ? `<span class="badge neutral"><span class="dot"></span>${esc(x.h.src)}</span>` : x.h.used?'<span class="badge good"><span class="dot"></span>Used</span>':'<span class="badge warn"><span class="dot"></span>Not used</span>')}</td><td class="muted">${x.logged?'marked by hand':esc(x.h.src)}</td><td>${esc(x.h.team||'')}</td><td class="num mono">${x.h.hours?x.h.hours.toFixed(1):''}</td><td class="num mono">${x.h.cost?money(x.h.cost):''}</td><td><button class="btn btn-sm btn-ghost" data-du-row="${x.d}" data-du-set="${x.logged==='Used'?'Idle':'Used'}">${x.logged==='Used'?'Mark not used':'Mark used'}</button></td></tr>`).join('')}</tbody></table></div>`;
   } else if(DRAWER_TAB==='maint'){
     body = `<div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary btn-sm" id="dr-add-maint">${ICONS.plus}Send for maintenance</button></div>` + (mt.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>Sent</th><th>Returned</th><th class="num">Days</th><th>Type</th><th>Reason</th><th>Workshop</th><th class="num">Cost</th><th></th></tr></thead><tbody>${mt.map(m=>{ const d = m.return_date ? Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)) : daysSince(m.date_out); return `<tr><td class="mono">${esc(m.date_out)}</td><td>${m.return_date?`<span class="mono">${esc(m.return_date)}</span>`:'<span class="badge warn"><span class="dot"></span>In maintenance</span>'}</td><td class="num mono">${d}</td><td>${esc(m.maint_type||'')}</td><td class="wrap">${esc(m.reason)}${m.work_done?`<div class="muted" style="font-size:11px">${esc(m.work_done)}</div>`:''}</td><td>${esc(m.workshop||'')}</td><td class="num mono">${money((Number(m.cost_parts)||0)+(Number(m.cost_labour)||0))}</td><td><button class="btn btn-sm btn-ghost" data-mid="${m.id}">${ICONS.edit}</button></td></tr>`;}).join('')}</tbody><tfoot><tr><td colspan="2">Total days in maintenance</td><td class="num mono">${mt.reduce((s,m)=>s+(m.return_date?Math.max(0,Math.round((new Date(m.return_date)-new Date(m.date_out))/86400000)):daysSince(m.date_out)),0)}</td><td colspan="3">Total maintenance cost</td><td class="num mono">${money(mt.reduce((s,m)=>s+(Number(m.cost_parts)||0)+(Number(m.cost_labour)||0),0))}</td><td></td></tr></tfoot></table></div>` : `<div class="empty-row">This ${type.toLowerCase()} has never been sent for maintenance.</div>`);
   } else {
@@ -2493,6 +2516,8 @@ function openAssetDrawer(type, ref, tab){
   document.getElementById('drawer-edit').addEventListener('click', ()=>{ close(); openForm(isV?'vehicles':'equipment', a.id); });
   document.querySelectorAll('.drawer .tab').forEach(t=> t.addEventListener('click', ()=> openAssetDrawer(type, ref, t.dataset.tab)));
   const am = document.getElementById('dr-add-maint'); if(am) am.addEventListener('click', ()=>{ close(); openForm('maintenance', null, {asset_type:type, asset_ref:ref}); });
+  document.querySelectorAll('.drawer [data-du]').forEach(b=> b.addEventListener('click', async ()=>{ const d=document.getElementById('du-date').value; if(!d) return; await setDailyUsage(type, ref, d, b.dataset.du); toast(b.dataset.du?`${ref}: ${b.dataset.du==='Used'?'used':'not used'} on ${fmtDate(d)}`:'Mark cleared','good'); openAssetDrawer(type, ref, 'usage'); }));
+  document.querySelectorAll('.drawer [data-du-row]').forEach(b=> b.addEventListener('click', async ()=>{ await setDailyUsage(type, ref, b.dataset.duRow, b.dataset.duSet); openAssetDrawer(type, ref, 'usage'); }));
   document.querySelectorAll('[data-mid]').forEach(b=> b.addEventListener('click', ()=>{ close(); openForm('maintenance', Number(b.dataset.mid)); }));
 }
 
@@ -2567,7 +2592,7 @@ function maintDays(type, ref, from, to){ return q('SELECT date_out, return_date 
 function rentalDaysFor(a, from, to){ return overlapDays(a.rental_start||'0000-01-01', a.rental_end||'', from, to); }
 function rentalCostFor(a, from, to){ if(!a) return 0; const ctx=hireContext(from,to); const days=[...activeDaysInPeriod(from,to)].sort(); return assetHireRange(ctx, typeOfAsset(a), a, days).cost; }
 function assetUsedDays(type, a, from, to){
-  const ref = type==='Vehicle' ? a.vno : a.no;
+  const ref = type==='Vehicle' ? a.vno : a.no; if(a.count_from && a.count_from>from) from=a.count_from; if(from>to) return 0;
   const logged = qv('SELECT COUNT(*) FROM daily_usage WHERE asset_type=? AND asset_ref=? AND date>=? AND date<=?',[type,ref,from,to]);
   if(logged) return qv('SELECT COUNT(*) FROM daily_usage WHERE asset_type=? AND asset_ref=? AND date>=? AND date<=? AND status="Used"',[type,ref,from,to]);
   const rows = type==='Vehicle' ? q('SELECT date_out, return_date FROM vehicle_moves WHERE vno=? AND date_out<=? AND (return_date="" OR return_date IS NULL OR return_date>=?)',[a.vno,to,from])
@@ -2635,6 +2660,7 @@ function assetHireDay(ctx, type, a, d){
   const driver = type==='Vehicle' ? String((mv && mv.driver) || a.driver || '').trim().toUpperCase() : '';
   const {rate, basis} = rateFrom(ctx.rates[k], d, a);
   const out = {date:d, type, ref, team:team||'', project, driver, rate, basis, hours:0, cost:0, used:false, src:''};
+  if(a.count_from && d < a.count_from){ out.src='not counted yet'; return out; }
   if(/out of service/i.test(a.status||'')){ out.src='out of service'; return out; }
   if(mem.maint.some(m=>overlapDays(m.date_out, m.return_date||'', d, d)>0)){ out.src='maintenance'; return out; }
   if(rentalDaysFor(a,d,d)<=0){ out.src='not on hire'; return out; }
@@ -2892,7 +2918,9 @@ function renderCost(){
   const trend = trendSeries(COST_MODE==='custom'?'daily':COST_MODE, COST_MODE==='daily'?COST_ANCHOR.daily:COST_MODE==='monthly'?COST_ANCHOR.monthly:COST_MODE==='annual'?COST_ANCHOR.annual:to);
   const trendTitle = COST_MODE==='annual' ? 'By month' : COST_MODE==='monthly' ? 'By day' : 'Last 14 days';
   const kpi = (l,v,foot,tone,go,chip)=>`<div class="card" ${go?`data-go="${go}" data-chip="${chip||''}"`:''}><div class="card-label">${l}</div><div class="card-value ${tone||''}">${v}</div><div class="card-foot">${foot}</div></div>`;
-  const hireTable = (rows, isV)=> rows.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>${isV?'Vehicle':'Equipment'}</th><th>Team</th><th>Project</th><th class="num">Rate now</th><th class="num">Days</th><th class="num">Duty hours</th><th class="num">Hours used</th><th class="num">Utilisation</th><th class="num">Hire (BD)</th><th class="num">Idle hire (BD)</th></tr></thead><tbody>${rows.map(a=>`<tr data-drawer="${a.type}" data-ref="${esc(a.ref)}" style="cursor:pointer"><td>${esc(a.label)}</td><td>${esc(a.team)}</td><td>${esc(a.project||'')}</td><td class="num mono">${money(a.rate_now)} / ${esc(a.basis_now)}</td><td class="num mono">${a.days}</td><td class="num mono">${(a.hours||0).toFixed(1)}</td><td class="num mono">${(a.usedHours||0).toFixed(1)}</td><td class="num mono" style="color:${a.util<0.3?'var(--bad)':a.util<0.6?'var(--warn)':'var(--good)'}">${Math.round(a.util*100)}%</td><td class="num mono">${money(a.cost)}</td><td class="num mono">${money(a.idle)}</td></tr>`).join('')}</tbody><tfoot><tr><td colspan="8">Total</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.cost,0))}</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.idle,0))}</td></tr></tfoot></table></div>` : `<div class="empty-row">No rented ${isV?'vehicles':'equipment'} with a hire rate in this period.</div>`;
+  const dayMode = COST_MODE==='daily', dayD = COST_ANCHOR.daily;
+  const useBtn = a=>{ if(!dayMode) return ''; const m=usageOn(a.type,a.ref,dayD); const used = m ? m==='Used' : (a.used>0); return `<td onclick="event.stopPropagation()"><button class="pill-toggle ${used?'on':'off'}" data-du-type="${a.type}" data-du-ref="${esc(a.ref)}" data-du-next="${used?'Idle':'Used'}" title="${m?'Marked by hand — click to change':'Inferred — click to mark'}"><span class="dot"></span>${used?'Used':'Not used'}${m?'':' ?'}</button></td>`; };
+  const hireTable = (rows, isV)=> rows.length ? `<div class="scroll-x"><table class="plain"><thead><tr><th>${isV?'Vehicle':'Equipment'}</th><th>Team</th><th>Project</th><th class="num">Rate now</th><th class="num">Days</th><th class="num">Duty hours</th><th class="num">Hours used</th><th class="num">Utilisation</th><th class="num">Hire (BD)</th><th class="num">Idle hire (BD)</th>${dayMode?'<th>Used today</th>':''}</tr></thead><tbody>${rows.map(a=>`<tr data-drawer="${a.type}" data-ref="${esc(a.ref)}" style="cursor:pointer"><td>${esc(a.label)}</td><td>${esc(a.team)}</td><td>${esc(a.project||'')}</td><td class="num mono">${money(a.rate_now)} / ${esc(a.basis_now)}</td><td class="num mono">${a.days}</td><td class="num mono">${(a.hours||0).toFixed(1)}</td><td class="num mono">${(a.usedHours||0).toFixed(1)}</td><td class="num mono" style="color:${a.util<0.3?'var(--bad)':a.util<0.6?'var(--warn)':'var(--good)'}">${Math.round(a.util*100)}%</td><td class="num mono">${money(a.cost)}</td><td class="num mono">${money(a.idle)}</td>${useBtn(a)}</tr>`).join('')}</tbody><tfoot><tr><td colspan="8">Total</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.cost,0))}</td><td class="num mono">${money(rows.reduce((x,a)=>x+a.idle,0))}</td>${dayMode?'<td></td>':''}</tr></tfoot></table></div>` : `<div class="empty-row">No rented ${isV?'vehicles':'equipment'} with a hire rate in this period.</div>`;
   document.getElementById('content').innerHTML = `
     <div class="toolbar"><div class="chips">${modes.map(m=>`<button class="chip ${COST_MODE===m[0]?'on':''}" data-mode="${m[0]}">${m[1]}</button>`).join('')}</div><span class="sp"></span>${nav}</div>
     <div class="toolbar"><span class="muted" style="font-size:12px;margin-right:6px">Project</span><div class="chips"><button class="chip ${COST_PROJECT===''?'on':''}" data-project="">All projects</button>${projects.map(p=>`<button class="chip ${COST_PROJECT===p?'on':''}" data-project="${esc(p)}">${esc(p)}</button>`).join('')}</div><span class="sp"></span>${COST_MODE==='daily'&&can('salary')?`<button class="btn btn-primary" id="cost-daily-rpt">${ICONS.sheet}Daily Cost Report (Excel)</button>`:''}<button class="btn" id="cost-export">${ICONS.download}Cost analysis workbook (Excel, live formulas)</button></div>
@@ -2931,6 +2959,7 @@ function renderCost(){
   if(td) td.addEventListener('click', ()=>{ COST_ANCHOR.daily=todayStr(); COST_ANCHOR.monthly=todayStr().slice(0,7); COST_ANCHOR.annual=todayStr().slice(0,4); renderCost(); });
   document.querySelectorAll('[data-go]').forEach(el=> el.addEventListener('click', ()=> go(el.dataset.go,{chip:el.dataset.chip||''})));
   document.querySelectorAll('[data-drawer]').forEach(el=> el.addEventListener('click', ()=> openAssetDrawer(el.dataset.drawer, el.dataset.ref, 'cost')));
+  document.querySelectorAll('[data-du-type]').forEach(b=> b.addEventListener('click', async e=>{ e.stopPropagation(); await setDailyUsage(b.dataset.duType, b.dataset.duRef, COST_ANCHOR.daily, b.dataset.duNext); render(); }));
   document.getElementById('cost-export').addEventListener('click', ()=> exportCostReport(s, label));
   const dr=document.getElementById('cost-daily-rpt'); if(dr) dr.addEventListener('click', ()=> downloadDailyCostReport(COST_ANCHOR.daily));
 }
